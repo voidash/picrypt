@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write    # upload release assets
+  id-token: write    # cosign keyless via OIDC
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: false
+            archive: tar.gz
+            bins: server+client
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+            archive: tar.gz
+            bins: server+client
+          - target: x86_64-apple-darwin
+            os: macos-13
+            cross: false
+            archive: tar.gz
+            bins: client
+          - target: aarch64-apple-darwin
+            os: macos-14
+            cross: false
+            archive: tar.gz
+            bins: client
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            archive: zip
+            bins: client
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install musl-tools (Linux x86_64 musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build with cross (server + client)
+        if: matrix.cross && matrix.bins == 'server+client'
+        run: cross build --release --locked --target ${{ matrix.target }} -p picrypt-server -p picrypt-client
+
+      - name: Build with cargo (server + client)
+        if: ${{ !matrix.cross && matrix.bins == 'server+client' }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p picrypt-server -p picrypt-client
+
+      - name: Build with cargo (client only)
+        if: ${{ !matrix.cross && matrix.bins == 'client' }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p picrypt-client
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          stage="picrypt-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$stage"
+
+          # Binaries
+          if [[ "${{ matrix.bins }}" == *"server"* ]]; then
+            cp "target/${{ matrix.target }}/release/picrypt-server" "dist/$stage/"
+            strip "dist/$stage/picrypt-server" 2>/dev/null || true
+          fi
+          cp "target/${{ matrix.target }}/release/picrypt-client" "dist/$stage/"
+          strip "dist/$stage/picrypt-client" 2>/dev/null || true
+
+          # Docs
+          cp README.md LICENSE "dist/$stage/"
+
+          # Server-only payload (Linux): deploy + Linux hardening
+          if [[ "${{ matrix.bins }}" == *"server"* ]]; then
+            mkdir -p "dist/$stage/deploy" "dist/$stage/scripts"
+            cp deploy/install-server.sh deploy/install-client.sh deploy/picrypt-server.service "dist/$stage/deploy/"
+            cp scripts/harden-linux.sh "dist/$stage/scripts/"
+            chmod +x "dist/$stage/deploy/"*.sh "dist/$stage/scripts/"*.sh
+          fi
+
+          # macOS client: shipping macOS scripts
+          if [[ "${{ matrix.target }}" == *"darwin"* ]]; then
+            mkdir -p "dist/$stage/scripts"
+            cp scripts/harden-macos.sh scripts/setup-hotkey-macos.sh "dist/$stage/scripts/"
+            chmod +x "dist/$stage/scripts/"*.sh
+          fi
+
+          tar -czf "dist/$stage.tar.gz" -C dist "$stage"
+          rm -rf "dist/$stage"
+
+          (cd dist && shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256")
+          echo "ARCHIVE=dist/$stage.tar.gz" >> "$GITHUB_ENV"
+          echo "ARCHIVE_NAME=$stage.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          $stage = "picrypt-$env:TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$stage" -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/picrypt-client.exe" "dist/$stage/"
+          Copy-Item README.md "dist/$stage/"
+          Copy-Item LICENSE "dist/$stage/"
+          New-Item -ItemType Directory -Path "dist/$stage/scripts" -Force | Out-Null
+          Copy-Item scripts/harden-windows.ps1 "dist/$stage/scripts/"
+          Copy-Item scripts/setup-hotkey-windows.ps1 "dist/$stage/scripts/"
+          Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip"
+          Remove-Item -Recurse -Force "dist/$stage"
+          $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "dist/$stage.zip.sha256" -Value "$hash  $stage.zip"
+          "ARCHIVE=dist/$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ARCHIVE_NAME=$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign artifact (keyless via Sigstore)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --output-signature "${ARCHIVE}.sig" \
+            --output-certificate "${ARCHIVE}.crt" \
+            "${ARCHIVE}"
+          ls -la dist/
+
+      - name: Verify signature locally (sanity)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign verify-blob \
+            --certificate "${ARCHIVE}.crt" \
+            --signature   "${ARCHIVE}.sig" \
+            --certificate-identity-regexp "^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/v.*$" \
+            --certificate-oidc-issuer     https://token.actions.githubusercontent.com \
+            "${ARCHIVE}"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          files: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+            ${{ env.ARCHIVE }}.sig
+            ${{ env.ARCHIVE }}.crt
+          generate_release_notes: true
+          fail_on_unmatched_files: true

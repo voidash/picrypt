@@ -1,0 +1,42 @@
+[package]
+name = "picrypt-server"
+description = "Network-gated VeraCrypt key escrow daemon — runs on a Pi, hands out per-device keyfiles to authenticated clients, supports global panic lock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+picrypt-common = { path = "../common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+dirs = { workspace = true }
+futures-util = { workspace = true }
+argon2 = { workspace = true }
+toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

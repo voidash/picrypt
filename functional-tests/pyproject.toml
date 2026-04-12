@@ -1,0 +1,14 @@
+[project]
+name = "picrypt-functional-tests"
+version = "0.1.0"
+description = "Functional test suite for picrypt"
+requires-python = ">=3.10"
+
+dependencies = [
+    "flexitest",
+    "requests>=2.31.0",
+    "websocket-client>=1.6.0",
+]
+
+[tool.uv.sources]
+flexitest = { git = "https://codeberg.org/treyd/flexitest.git" }

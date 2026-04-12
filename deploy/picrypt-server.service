@@ -1,0 +1,64 @@
+[Unit]
+Description=picrypt key management server
+Documentation=https://github.com/cdjk/picrypt
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=simple
+User=picrypt
+Group=picrypt
+ExecStart=/usr/local/bin/picrypt-server
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=10
+
+# Environment
+Environment=RUST_LOG=info
+
+# Memory locking — required for mlockall() to prevent key material from being
+# swapped to disk.
+LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_IPC_LOCK
+
+# Filesystem hardening
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/home/picrypt/.picrypt
+
+# Privilege hardening
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+PrivateDevices=yes
+
+# Network hardening — only needs TCP listen
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SocketBindDeny=*
+SocketBindAllow=tcp:7123
+
+# Restrict namespaces and system calls
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# Kill any remaining processes on service stop
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=picrypt-server
+
+[Install]
+WantedBy=multi-user.target

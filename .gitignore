@@ -1,0 +1,52 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Cargo
+.cargo/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Functional tests
+functional-tests/_dd/
+functional-tests/.venv/
+functional-tests/__pycache__/
+**/__pycache__/
+*.pyc
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/
+
+# Build artifacts
+*.log
+*.tmp
+*.bak
+
+# Local secrets — never commit
+*.key
+*.pem
+*.token
+secrets/
+.env
+.env.*
+!.env.example
+
+# OS
+.Trashes
+.Spotlight-V100
+.fseventsd
