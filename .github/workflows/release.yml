@@ -40,12 +40,12 @@ jobs:
             archive: tar.gz
             bins: server+client
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             cross: false
             archive: tar.gz
             bins: client
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             cross: false
             archive: tar.gz
             bins: client
