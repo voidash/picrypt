@@ -273,3 +273,110 @@ async fn get_key_on_fresh_sealed_server_returns_error() {
         resp.status()
     );
 }
+
+// ---------------------------------------------------------------------------
+// /admin-token — reveals the admin token to anyone with the master password
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn admin_token_endpoint_returns_token_with_correct_password() {
+    let server = TestServer::start_default().await;
+
+    // First-time unseal sets the master password.
+    let unseal_resp = server.unseal(TEST_PASSWORD).await;
+    assert_eq!(unseal_resp.status().as_u16(), 200);
+
+    // Ask for the admin token.
+    let resp = server.get_admin_token(TEST_PASSWORD).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/admin-token with correct password must succeed"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let token = body["admin_token"].as_str().expect("missing admin_token");
+    assert!(!token.is_empty(), "admin_token must not be empty");
+
+    // The returned token must actually authorize device management.
+    // Use it to register a device — same flow that admin_auth_middleware
+    // verifies, so this proves we got the real token.
+    let register_resp = reqwest::Client::new()
+        .post(format!("{}/devices/register", server.base_url))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "device_name": "registered-via-revealed-token",
+            "platform": "linux"
+        }))
+        .send()
+        .await
+        .expect("register request failed");
+    assert_eq!(
+        register_resp.status().as_u16(),
+        200,
+        "the returned admin token must authorize /devices/register"
+    );
+}
+
+#[tokio::test]
+async fn admin_token_endpoint_rejects_wrong_password() {
+    let server = TestServer::start_default().await;
+
+    // Initialize the keystore.
+    server.unseal(TEST_PASSWORD).await;
+
+    let resp = server.get_admin_token("the-wrong-password").await;
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "wrong password must return 401"
+    );
+
+    // Body must NOT contain the actual token.
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains("admin_token"),
+        "401 response body must not leak token: {body}"
+    );
+}
+
+#[tokio::test]
+async fn admin_token_endpoint_works_when_sealed() {
+    let server = TestServer::start_default().await;
+
+    // Initialize, then lock back to sealed.
+    server.unseal(TEST_PASSWORD).await;
+    server.lock(None).await;
+    let hb: serde_json::Value = server.heartbeat().await.json().await.unwrap();
+    assert_eq!(hb["state"], "sealed");
+
+    // Sealed → still works (this is the whole point: master password
+    // can recover the admin token without unsealing first).
+    let resp = server.get_admin_token(TEST_PASSWORD).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/admin-token must work even when server is sealed"
+    );
+
+    // After fetching the token, the server must STILL be sealed
+    // (the endpoint must not transition state).
+    let hb_after: serde_json::Value = server.heartbeat().await.json().await.unwrap();
+    assert_eq!(
+        hb_after["state"], "sealed",
+        "/admin-token must not change server state"
+    );
+}
+
+#[tokio::test]
+async fn admin_token_endpoint_uninitialized_errors() {
+    let server = TestServer::start_default().await;
+
+    // Server has never been unsealed — no master_key.enc on disk.
+    let resp = server.get_admin_token("anything").await;
+    // Either 4xx or 5xx is acceptable; 200 would be a leak.
+    assert!(
+        resp.status().as_u16() >= 400,
+        "fresh-uninstalled server must reject /admin-token, got {}",
+        resp.status()
+    );
+}

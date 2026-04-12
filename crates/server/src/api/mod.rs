@@ -1,3 +1,4 @@
+mod admin_token;
 mod devices;
 mod heartbeat;
 mod key;
@@ -38,11 +39,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             admin_auth_middleware,
         ));
 
-    // Public routes — no auth required.
+    // Public routes — no auth required (each enforces its own rate limit).
     let public = Router::new()
         .route("/heartbeat", get(heartbeat::heartbeat))
         .route("/unseal", post(unseal::unseal))
-        .route("/lock", post(lock::lock));
+        .route("/lock", post(lock::lock))
+        .route("/admin-token", post(admin_token::admin_token));
 
     Router::new()
         .merge(device_auth)

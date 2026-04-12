@@ -188,4 +188,14 @@ impl TestServer {
             .await
             .expect("revoke_device request failed")
     }
+
+    /// POST /admin-token with the given master password.
+    pub async fn get_admin_token(&self, password: &str) -> Response {
+        self.client
+            .post(format!("{}/admin-token", self.base_url))
+            .json(&serde_json::json!({ "password": password }))
+            .send()
+            .await
+            .expect("admin_token request failed")
+    }
 }

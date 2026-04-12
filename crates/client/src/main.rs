@@ -77,6 +77,23 @@ enum Command {
         yubikey: bool,
     },
 
+    /// Reveal the admin token by proving you know the master password.
+    /// Lets the master password recover everything (i.e. you don't need to
+    /// store the admin token separately). Reads the password from --password,
+    /// from --password-file, or from stdin (so it works in shell pipes
+    /// without leaking the password into argv / process listings).
+    AdminToken {
+        /// Master password (insecure — visible in `ps`. Prefer --password-file or stdin.)
+        #[arg(long)]
+        password: Option<String>,
+        /// File containing the master password (e.g. ~/.fmw)
+        #[arg(long)]
+        password_file: Option<String>,
+        /// Server URL override (default: server_url from client.toml)
+        #[arg(long)]
+        server_url: Option<String>,
+    },
+
     /// Create a new VeraCrypt container using the server-managed keyfile
     CreateContainer {
         /// Path for the new container file (e.g. ~/vault.hc)
@@ -207,6 +224,19 @@ async fn main() -> anyhow::Result<()> {
                     recovery::recover(&config)?;
                 }
             }
+        }
+        Command::AdminToken {
+            password,
+            password_file,
+            server_url,
+        } => {
+            cmd_admin_token(
+                cli.config.as_deref(),
+                password,
+                password_file.as_deref(),
+                server_url.as_deref(),
+            )
+            .await?;
         }
         Command::CreateContainer {
             path,
@@ -386,6 +416,79 @@ async fn cmd_status(config: &ClientConfig) -> anyhow::Result<()> {
             volume.container, volume.mount_point, status
         );
     }
+
+    Ok(())
+}
+
+async fn cmd_admin_token(
+    config_path: Option<&str>,
+    password_arg: Option<String>,
+    password_file: Option<&str>,
+    server_url_override: Option<&str>,
+) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+
+    // Resolve server URL — prefer the override, fall back to client.toml.
+    let server_url = match server_url_override {
+        Some(url) => url.to_string(),
+        None => {
+            let config = load_config(config_path)
+                .context("no --server-url given and no client.toml found")?;
+            config.server_url.clone()
+        }
+    };
+
+    // Resolve password. Explicit flags always win — stdin is only consulted
+    // as a fallback when no flag was given, and only if stdin is a pipe
+    // (so an interactive shell doesn't block waiting for the user to type).
+    //   1. --password-file
+    //   2. --password
+    //   3. piped stdin
+    let password = if let Some(path) = password_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read password file {path}"))?;
+        raw.trim_end_matches(['\n', '\r']).to_string()
+    } else if let Some(pw) = password_arg {
+        pw
+    } else if !std::io::stdin().is_terminal() {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_line(&mut buf)
+            .context("failed to read password from stdin")?;
+        buf.trim_end_matches(['\n', '\r']).to_string()
+    } else {
+        anyhow::bail!("no password provided. Use --password-file, --password, or pipe via stdin");
+    };
+
+    if password.is_empty() {
+        anyhow::bail!("password is empty");
+    }
+
+    let url = format!("{}/admin-token", server_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("failed to build http client")?;
+
+    let resp = client
+        .post(&url)
+        .json(&picrypt_common::protocol::AdminTokenRequest { password })
+        .send()
+        .await
+        .context("failed to POST /admin-token")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("/admin-token returned {status}: {body}");
+    }
+
+    let body: picrypt_common::protocol::AdminTokenResponse =
+        resp.json().await.context("failed to parse response")?;
+
+    // Pipe-friendly: print just the token to stdout, nothing else.
+    // Suitable for `picrypt admin-token >> ~/.fmw` or `picrypt admin-token | pbcopy`.
+    println!("{}", body.admin_token);
 
     Ok(())
 }

@@ -96,6 +96,27 @@ pub struct RegisterDeviceRequest {
     pub platform: Platform,
 }
 
+/// Reveal the admin token to anyone who can prove they know the master
+/// password. Lets the master password act as the single root secret —
+/// you can recover the admin token (and via it, every device-management
+/// operation) without storing it separately. Goes through the same rate
+/// limiter as `/unseal` so brute force is no easier than guessing the
+/// master password directly.
+///
+/// NOTE: Debug omitted to keep the password out of logs.
+#[derive(Serialize, Deserialize)]
+pub struct AdminTokenRequest {
+    pub password: String,
+}
+
+impl std::fmt::Debug for AdminTokenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminTokenRequest")
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Lock request — optional PIN for authenticated lock.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LockRequest {
@@ -124,6 +145,20 @@ pub struct UnsealResponse {
 pub struct LockResponse {
     pub state: ServerState,
     pub devices_notified: usize,
+}
+
+/// NOTE: Debug intentionally redacts the token.
+#[derive(Serialize, Deserialize)]
+pub struct AdminTokenResponse {
+    pub admin_token: String,
+}
+
+impl std::fmt::Debug for AdminTokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminTokenResponse")
+            .field("admin_token", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// NOTE: Debug intentionally redacts auth_token and keyfile.

@@ -93,14 +93,20 @@ log_info "Ensuring 'picrypt' system user exists..."
 if id picrypt &>/dev/null; then
     log_ok "User 'picrypt' already exists"
 else
-    useradd --system --shell /usr/sbin/nologin --home-dir /home/picrypt --create-home picrypt
+    # Use /var/lib/picrypt as the home dir so it lines up with the
+    # systemd unit's StateDirectory= and HOME= environment override.
+    # /home/picrypt is intentionally NOT used: the unit hardens with
+    # ProtectHome=yes, which makes /home invisible to the service.
+    useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/picrypt picrypt
     log_ok "Created system user 'picrypt'"
 fi
 
-# Ensure home directory exists with correct ownership
-mkdir -p /home/picrypt/.picrypt/data
-chown -R picrypt:picrypt /home/picrypt
-chmod 700 /home/picrypt/.picrypt
+# Ensure the state dir exists with correct ownership. systemd's
+# StateDirectory= will (re-)create this on each start, but we need it
+# now so we can drop server.toml in before the service is enabled.
+mkdir -p /var/lib/picrypt/.picrypt/data
+chown -R picrypt:picrypt /var/lib/picrypt
+chmod 700 /var/lib/picrypt /var/lib/picrypt/.picrypt
 
 # --------------------------------------------------------------------------- #
 # Install binary
@@ -167,8 +173,21 @@ log_ok "Service file installed"
 # Generate server.toml (only if it doesn't exist)
 # --------------------------------------------------------------------------- #
 
-CONFIG_DIR="/home/picrypt/.picrypt"
+CONFIG_DIR="/var/lib/picrypt/.picrypt"
 CONFIG_FILE="${CONFIG_DIR}/server.toml"
+
+# Migrate from the old /home/picrypt location if a previous install left
+# config there. We move (not copy) so the post-install service has only
+# one source of truth, and we don't accidentally read stale state later.
+if [[ -f "/home/picrypt/.picrypt/server.toml" && ! -f "${CONFIG_FILE}" ]]; then
+    log_info "Migrating existing server.toml from /home/picrypt → /var/lib/picrypt"
+    cp -a /home/picrypt/.picrypt/. "${CONFIG_DIR}/"
+    chown -R picrypt:picrypt /var/lib/picrypt
+    chmod 700 /var/lib/picrypt "${CONFIG_DIR}"
+    # Rewrite data_dir if it points at the old location.
+    sed -i 's|"/home/picrypt/\.picrypt/data"|"/var/lib/picrypt/.picrypt/data"|' "${CONFIG_FILE}" || true
+    log_ok "Migrated config to ${CONFIG_FILE}"
+fi
 GENERATED_TOKEN=""
 GENERATED_PIN=""
 

@@ -446,6 +446,58 @@ impl AppState {
         self.activate_with_master_key(master_key).await
     }
 
+    /// Verify the master password without changing server state.
+    ///
+    /// Re-runs the same KDF + AES-GCM decrypt as `unseal_password_inner`
+    /// against the on-disk `master_key.enc`, but discards the decrypted
+    /// master key immediately. The AES-GCM auth tag is the verification —
+    /// if decryption succeeds, the password was correct.
+    ///
+    /// Goes through the same rate limiter as `unseal_password` so that
+    /// brute-force attempts against this endpoint are no easier than
+    /// against /unseal directly.
+    pub async fn verify_master_password(&self, password: &str) -> Result<(), ApiError> {
+        self.check_unseal_rate_limit()?;
+
+        if !self.keystore.is_initialized() {
+            return Err(ApiError::Internal(
+                "server not initialized — run /unseal first to set the master password".to_string(),
+            ));
+        }
+
+        let encrypted_mk = self
+            .keystore
+            .load_encrypted_master_key_password()
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .ok_or(ApiError::Internal(
+                "password-based unseal not configured for this server".to_string(),
+            ))?;
+
+        let params = self
+            .kdf_params
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| ApiError::Internal("KDF params missing".to_string()))?;
+
+        let pw_key = crypto::derive_master_key(password.as_bytes(), &params)
+            .map_err(|e| ApiError::Internal(format!("key derivation failed: {e}")))?;
+
+        match crypto::decrypt(&encrypted_mk, pw_key.as_bytes()) {
+            Ok(mut mk_bytes) => {
+                // Throw away the decrypted master key immediately — we only
+                // needed verification, not the key itself.
+                mk_bytes.zeroize();
+                self.reset_unseal_rate_limit();
+                Ok(())
+            }
+            Err(_) => {
+                self.record_unseal_failure();
+                Err(ApiError::InvalidPassword)
+            }
+        }
+    }
+
     /// Unseal with both password and YubiKey (first-time dual setup only).
     /// Holds the transition mutex. Falls back to password-only if already initialized.
     pub async fn unseal_both(&self, password: &str) -> Result<usize, ApiError> {
@@ -1042,5 +1094,86 @@ mod tests {
             idle <= 1,
             "idle_seconds should be near zero right after touch, got {idle}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_master_password
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn verify_master_password_correct() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        // Initialize the keystore by unsealing for the first time.
+        state
+            .unseal_password("the-real-master-password")
+            .await
+            .expect("first unseal failed");
+
+        // verify_master_password should accept the same password whether
+        // the server is currently active OR sealed.
+        state
+            .verify_master_password("the-real-master-password")
+            .await
+            .expect("verify with correct password (active) should succeed");
+
+        // Lock back to sealed and try again.
+        state.lock().await.expect("lock failed");
+        state
+            .verify_master_password("the-real-master-password")
+            .await
+            .expect("verify with correct password (sealed) should succeed");
+
+        // verify_master_password must NOT change state.
+        assert_eq!(state.current_state().await, ServerState::Sealed);
+    }
+
+    #[tokio::test]
+    async fn verify_master_password_wrong_returns_invalid() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("the-real-master-password")
+            .await
+            .expect("first unseal failed");
+
+        let result = state.verify_master_password("a-wrong-password").await;
+        assert!(matches!(result, Err(ApiError::InvalidPassword)));
+    }
+
+    #[tokio::test]
+    async fn verify_master_password_uninitialized_errors() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        // Server has never been unsealed — no master_key.enc on disk.
+        let result = state.verify_master_password("anything").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_master_password_does_not_change_state() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("pw-change-state-test")
+            .await
+            .expect("first unseal failed");
+        state.lock().await.expect("lock failed");
+        assert_eq!(state.current_state().await, ServerState::Sealed);
+
+        // Verify with correct password — must NOT transition to Active.
+        state
+            .verify_master_password("pw-change-state-test")
+            .await
+            .expect("verify failed");
+        assert_eq!(state.current_state().await, ServerState::Sealed);
+
+        // Verify with wrong password — must also NOT transition.
+        let _ = state.verify_master_password("wrong").await;
+        assert_eq!(state.current_state().await, ServerState::Sealed);
     }
 }
