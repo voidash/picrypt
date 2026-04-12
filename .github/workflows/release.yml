@@ -127,11 +127,13 @@ jobs:
             chmod +x "dist/$stage/deploy/"*.sh "dist/$stage/scripts/"*.sh
           fi
 
-          # macOS client: shipping macOS scripts
+          # macOS client: shipping macOS scripts + install-client.sh so the
+          # self-bootstrapping install.sh can run it after extracting.
           if [[ "${{ matrix.target }}" == *"darwin"* ]]; then
-            mkdir -p "dist/$stage/scripts"
+            mkdir -p "dist/$stage/scripts" "dist/$stage/deploy"
             cp scripts/harden-macos.sh scripts/setup-hotkey-macos.sh "dist/$stage/scripts/"
-            chmod +x "dist/$stage/scripts/"*.sh
+            cp deploy/install-client.sh "dist/$stage/deploy/"
+            chmod +x "dist/$stage/scripts/"*.sh "dist/$stage/deploy/"*.sh
           fi
 
           tar -czf "dist/$stage.tar.gz" -C dist "$stage"

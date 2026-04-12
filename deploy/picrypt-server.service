@@ -22,11 +22,17 @@ Environment=RUST_LOG=info
 LimitMEMLOCK=infinity
 AmbientCapabilities=CAP_IPC_LOCK
 
-# Filesystem hardening
+# Filesystem hardening.
+# ProtectHome=yes mounts an empty tmpfs over /home, which would hide
+# /home/picrypt/.picrypt from the unit's namespace. ReadWritePaths= cannot
+# pierce that tmpfs (the destination must already exist in the namespace).
+# BindPaths= bind-mounts the host's /home/picrypt over the empty tmpfs,
+# making /home/picrypt/.picrypt visible AND writable to the service while
+# keeping every other user's home invisible.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/home/picrypt/.picrypt
+BindPaths=/home/picrypt
 
 # Privilege hardening
 NoNewPrivileges=yes

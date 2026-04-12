@@ -11,7 +11,9 @@ class TestAdminTokenRequired(PicryptTest):
     """Device management requires admin token."""
 
     def __init__(self, ctx: flexitest.InitContext):
-        ctx.set_env("basic")
+        # Isolated env so the device-count assertion below is deterministic
+        # regardless of which other tests have run against the shared 'basic'.
+        ctx.set_env("auth_test")
 
     def main(self, ctx: flexitest.RunContext):
         server = self.get_server()

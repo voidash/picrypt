@@ -91,6 +91,7 @@ def main() -> int:
         "veracrypt_test": BasicEnv(),  # Isolated — VeraCrypt container creation
         "real_usage_test": BasicEnv(),  # Isolated — full real-usage simulation
         "dead_mans_switch_test": BasicEnv(),  # Isolated — Pi-killed simulation
+        "auth_test": BasicEnv(),  # Isolated — admin token tests assert exact device count
     }
 
     # Runtime
