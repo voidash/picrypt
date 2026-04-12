@@ -92,6 +92,11 @@ def main() -> int:
         "real_usage_test": BasicEnv(),  # Isolated — full real-usage simulation
         "dead_mans_switch_test": BasicEnv(),  # Isolated — Pi-killed simulation
         "auth_test": BasicEnv(),  # Isolated — admin token tests assert exact device count
+        "data_persistence_pi_kill": BasicEnv(),  # Isolated — kills + restarts the server
+        "data_persistence_many_files": BasicEnv(),  # Isolated — 50-file round-trip
+        "data_persistence_large_file": BasicEnv(),  # Isolated — 50MB round-trip
+        "postgres_persistence": BasicEnv(),  # Isolated — postgres in vault
+        "sqlite_persistence": BasicEnv(),  # Isolated — sqlite in vault
     }
 
     # Runtime
