@@ -519,6 +519,248 @@ impl AppState {
         self.unseal_password_inner(password).await
     }
 
+    // -----------------------------------------------------------------------
+    // Dual-factor unseal (v0.1.7+)
+    //
+    // The dual-factor path requires BOTH a password AND a pre-computed
+    // YubiKey HMAC-SHA1 response. The YubiKey lives on the client box (not
+    // on the picrypt-server itself) so the client touches it locally and
+    // sends the 20-byte response hex as part of the unseal request. This
+    // is the flow that actually defeats a "root on the server + coerced
+    // master password" attack: the attacker on the server cannot produce
+    // the YubiKey response without physical access to a YubiKey, which is
+    // in your pocket or your safe, somewhere else.
+    // -----------------------------------------------------------------------
+
+    /// Decode a hex YubiKey response (40 hex chars → 20 bytes) and return
+    /// the Argon2id-derived 32-byte key material that v0.1.7 uses as one
+    /// half of the dual-factor wrapping key.
+    fn derive_yk_key_from_hex_response(response_hex: &str) -> Result<[u8; 32], ApiError> {
+        let response_bytes = crypto::hex_decode(response_hex)
+            .map_err(|e| ApiError::Internal(format!("invalid yubikey response hex: {e}")))?;
+        if response_bytes.len() != 20 {
+            return Err(ApiError::Internal(format!(
+                "yubikey response must be 20 bytes (HMAC-SHA1 output), got {}",
+                response_bytes.len()
+            )));
+        }
+        yubikey::derive_key_from_response(&response_bytes)
+            .map_err(|e| ApiError::Internal(format!("yubikey key derivation failed: {e}")))
+    }
+
+    /// Unseal with password + client-provided YubiKey HMAC-SHA1 response.
+    /// Both factors are required; failure of either reports as
+    /// `InvalidPassword` so that timing does not leak which factor was
+    /// wrong.
+    pub async fn unseal_dual_factor(
+        &self,
+        password: &str,
+        yk_response_hex: &str,
+    ) -> Result<usize, ApiError> {
+        self.check_unseal_rate_limit()?;
+        let _guard = self.transition_mutex.lock().await;
+        self.check_not_active().await?;
+
+        if !self.keystore.has_dual_factor_unseal() {
+            return Err(ApiError::Internal(
+                "dual-factor unseal not configured on this server — \
+                 enroll a YubiKey first via `picrypt admin enroll-dual-factor`"
+                    .to_string(),
+            ));
+        }
+
+        self.unseal_dual_factor_inner(password, yk_response_hex)
+            .await
+    }
+
+    /// Internal dual-factor unseal logic. Caller MUST hold the transition mutex.
+    async fn unseal_dual_factor_inner(
+        &self,
+        password: &str,
+        yk_response_hex: &str,
+    ) -> Result<usize, ApiError> {
+        let encrypted_mk = self
+            .keystore
+            .load_encrypted_master_key_dual()
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .ok_or_else(|| ApiError::Internal("dual-factor master key blob missing".to_string()))?;
+
+        let params = self
+            .kdf_params
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| ApiError::Internal("KDF params missing".to_string()))?;
+
+        // Derive the password-side key (expensive Argon2id).
+        let pw_key = crypto::derive_master_key(password.as_bytes(), &params)
+            .map_err(|e| ApiError::Internal(format!("password key derivation failed: {e}")))?;
+
+        // Derive the YubiKey-side key from the client-provided response.
+        // Bad hex or wrong length here is a client error, not a credential
+        // failure — we return it as-is without bumping the rate limiter,
+        // because it's not a guessing attempt.
+        let yk_key = Self::derive_yk_key_from_hex_response(yk_response_hex)?;
+
+        // Combine the two into the wrapping key.
+        let mut combined = crypto::derive_dual_factor_key(pw_key.as_bytes(), &yk_key)
+            .map_err(|e| ApiError::Internal(format!("dual-factor key derivation failed: {e}")))?;
+
+        // AES-GCM tag verification is the factor check. If EITHER the
+        // password OR the yubikey response is wrong, combined_key is wrong,
+        // and decryption fails with a tag mismatch. We surface that as
+        // InvalidPassword so timing + error text don't leak which half
+        // was the bad one.
+        let decrypt_result = crypto::decrypt(&encrypted_mk, &combined);
+        combined.zeroize();
+
+        let mut mk_bytes = match decrypt_result {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.record_unseal_failure();
+                return Err(ApiError::InvalidPassword);
+            }
+        };
+
+        if mk_bytes.len() != 32 {
+            mk_bytes.zeroize();
+            return Err(ApiError::Internal(
+                "decrypted master key has wrong size".to_string(),
+            ));
+        }
+
+        let mut mk_array = [0u8; 32];
+        mk_array.copy_from_slice(&mk_bytes);
+        mk_bytes.zeroize();
+        let master_key = MasterKey::from_bytes(mk_array);
+        mk_array.zeroize();
+
+        self.reset_unseal_rate_limit();
+        self.activate_with_master_key(master_key).await
+    }
+
+    /// Upgrade an ALREADY-UNSEALED server from single-factor to dual-factor.
+    ///
+    /// Preconditions:
+    ///   * Server state is Active (master_key is in RAM).
+    ///   * Caller has admin authentication (enforced at the API layer).
+    ///   * Caller provides the current master password as a belt-and-braces
+    ///     check — admin token alone is not sufficient to bind a new
+    ///     YubiKey, because admin token + YubiKey would let an insider
+    ///     silently replace the second factor.
+    ///
+    /// Effect: takes the in-memory master key, re-encrypts it under a
+    /// wrapping key derived from (password, yubikey_response), writes
+    /// `encrypted_master_key_pw_yk.bin` and `yubikey_challenge.bin` to
+    /// disk. Does NOT delete the single-factor blob — that's a separate
+    /// explicit step (`finalize_dual_factor_migration`) run only after
+    /// the admin has verified the new blob opens cleanly.
+    pub async fn upgrade_to_dual_factor(
+        &self,
+        password: &str,
+        yk_challenge: &[u8],
+        yk_response_hex: &str,
+    ) -> Result<(), ApiError> {
+        let _guard = self.transition_mutex.lock().await;
+
+        // Must be Active — we need master_key in RAM.
+        let current_state = *self.state.read().await;
+        if current_state != ServerState::Active {
+            return Err(ApiError::Internal(format!(
+                "upgrade_to_dual_factor requires Active state, got {current_state}"
+            )));
+        }
+
+        // Belt-and-braces: verify the password matches the existing
+        // single-factor blob. An admin-token-only upgrade would let an
+        // insider silently rotate the second factor.
+        self.verify_master_password(password).await?;
+
+        // Derive both halves.
+        let params = self
+            .kdf_params
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| ApiError::Internal("KDF params missing".to_string()))?;
+        let pw_key = crypto::derive_master_key(password.as_bytes(), &params)
+            .map_err(|e| ApiError::Internal(format!("password key derivation failed: {e}")))?;
+        let yk_key = Self::derive_yk_key_from_hex_response(yk_response_hex)?;
+        let mut combined = crypto::derive_dual_factor_key(pw_key.as_bytes(), &yk_key)
+            .map_err(|e| ApiError::Internal(format!("dual-factor key derivation failed: {e}")))?;
+
+        // Pull the current master key out of RAM so we can re-encrypt it.
+        // We clone the 32 bytes through a local array so we don't take a
+        // long-held lock on master_key while we do the slow AES work.
+        let mut mk_bytes = {
+            let mk_guard = self.master_key.read().await;
+            let mk_ref = mk_guard.as_ref().ok_or_else(|| {
+                ApiError::Internal("master key missing while Active (race?)".to_string())
+            })?;
+            *mk_ref.as_bytes()
+        };
+
+        let encrypted = crypto::encrypt(&mk_bytes, &combined).map_err(|e| {
+            ApiError::Internal(format!("dual-factor master key encryption failed: {e}"))
+        });
+        mk_bytes.zeroize();
+        combined.zeroize();
+        let encrypted = encrypted?;
+
+        // Persist both the new blob and the challenge the client used.
+        // Order matters: write the blob first; if we wrote the challenge
+        // first and then crashed, we'd have a challenge without a blob
+        // and subsequent unseal attempts would not find what they need.
+        self.keystore
+            .save_encrypted_master_key_dual(&encrypted)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        self.keystore
+            .save_yubikey_challenge(yk_challenge)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        tracing::warn!(
+            "dual-factor unseal enrolled — existing single-factor blobs left in place. \
+             Run `picrypt admin finalize-dual-factor` to delete them."
+        );
+        Ok(())
+    }
+
+    /// Final step of dual-factor migration: permanently delete the old
+    /// single-factor blobs (password-only and YubiKey-only) so that
+    /// dual-factor is the only unseal path possible. Run this AFTER a
+    /// successful `upgrade_to_dual_factor` AND after you have verified
+    /// you can unseal with dual-factor in a test cycle — otherwise a bug
+    /// in the new path would leave you locked out.
+    ///
+    /// Requires Active state + admin auth (enforced at the API layer).
+    pub async fn finalize_dual_factor_migration(&self) -> Result<(), ApiError> {
+        let _guard = self.transition_mutex.lock().await;
+
+        let current_state = *self.state.read().await;
+        if current_state != ServerState::Active {
+            return Err(ApiError::Internal(format!(
+                "finalize_dual_factor_migration requires Active state, got {current_state}"
+            )));
+        }
+        if !self.keystore.has_dual_factor_unseal() {
+            return Err(ApiError::Internal(
+                "cannot finalize — no dual-factor blob on disk".to_string(),
+            ));
+        }
+
+        self.keystore
+            .delete_encrypted_master_key_password()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        self.keystore
+            .delete_encrypted_master_key_yubikey()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+        tracing::warn!(
+            "single-factor master key blobs deleted — dual-factor is now the only unseal path"
+        );
+        Ok(())
+    }
+
     /// Read-only reference to the auto-generated admin token.
     pub async fn generated_admin_token_ref(
         &self,
@@ -801,6 +1043,33 @@ impl AppState {
             .ok_or_else(|| ApiError::DeviceNotFound(device_id.to_string()))
     }
 
+    // -----------------------------------------------------------------------
+    // Keystore introspection (v0.1.7 — needed by the API handlers for
+    // routing decisions). These are thin read-only wrappers so the
+    // handlers don't need to know about the KeyStore type directly.
+    // -----------------------------------------------------------------------
+
+    pub fn keystore_has_password_unseal(&self) -> bool {
+        self.keystore.has_password_unseal()
+    }
+
+    pub fn keystore_has_yubikey_unseal(&self) -> bool {
+        self.keystore.has_yubikey_unseal()
+    }
+
+    pub fn keystore_has_dual_factor(&self) -> bool {
+        self.keystore.has_dual_factor_unseal()
+    }
+
+    /// Load the stored YubiKey challenge so the API can serve it to a
+    /// client via `GET /unseal/challenge`. Returns None if no challenge
+    /// has been stored yet (i.e. dual-factor has never been enrolled).
+    /// Any I/O error becomes None — the handler will report "missing"
+    /// which is the same user-visible result.
+    pub fn load_yubikey_challenge_for_client(&self) -> Option<Vec<u8>> {
+        self.keystore.load_yubikey_challenge().ok().flatten()
+    }
+
     pub async fn list_devices(&self) -> Vec<picrypt_common::protocol::DeviceListEntry> {
         let devices = self.devices.read().await;
         let connected = self.connected_devices.read().await;
@@ -859,6 +1128,7 @@ mod tests {
             dead_man_timeout_secs: 0,
             admin_token: None,
             lock_pin: None,
+            require_dual_factor: false,
         };
         AppState::new(config).expect("AppState::new failed")
     }
@@ -870,6 +1140,7 @@ mod tests {
             dead_man_timeout_secs: 0,
             admin_token: None,
             lock_pin: Some(pin.to_string()),
+            require_dual_factor: false,
         };
         AppState::new(config).expect("AppState::new failed")
     }
@@ -981,6 +1252,324 @@ mod tests {
             fetched, raw_keyfile,
             "fetched keyfile must match the one returned at registration"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // v0.1.7 dual-factor unseal tests
+    // ---------------------------------------------------------------
+    //
+    // These tests build a fake 20-byte YubiKey response. The server
+    // doesn't care that it didn't come from real hardware — the server
+    // just Argon2id-expands whatever 20 bytes it's handed into a 32-byte
+    // key. That's the same derivation path the real ykchalresp output
+    // would go through. As long as the test feeds the same "response"
+    // bytes at upgrade time and at unseal time, the math works out.
+
+    const TEST_YK_RESPONSE_OK: [u8; 20] = [0xAA; 20];
+    const TEST_YK_RESPONSE_BAD: [u8; 20] = [0xBB; 20];
+    const TEST_YK_CHALLENGE: [u8; 32] = [0xCC; 32];
+
+    fn yk_hex(response: &[u8; 20]) -> String {
+        crypto::hex_encode(response)
+    }
+
+    #[tokio::test]
+    async fn upgrade_to_dual_factor_from_password_unseal() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        // Init with password-only.
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        assert!(state.keystore.has_password_unseal());
+        assert!(!state.keystore.has_dual_factor_unseal());
+
+        // Upgrade.
+        state
+            .upgrade_to_dual_factor(
+                "strong-pw-42",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await
+            .expect("upgrade failed");
+
+        // Both blobs now exist; we haven't finalized yet.
+        assert!(state.keystore.has_password_unseal());
+        assert!(state.keystore.has_dual_factor_unseal());
+        // Challenge was persisted for the client to fetch at unseal time.
+        let stored_challenge = state
+            .keystore
+            .load_yubikey_challenge()
+            .expect("load challenge")
+            .expect("challenge should exist after upgrade");
+        assert_eq!(stored_challenge, TEST_YK_CHALLENGE);
+    }
+
+    #[tokio::test]
+    async fn dual_factor_unseal_after_upgrade_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        state
+            .upgrade_to_dual_factor(
+                "strong-pw-42",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await
+            .expect("upgrade");
+        state.lock().await.expect("lock");
+
+        state
+            .unseal_dual_factor("strong-pw-42", &yk_hex(&TEST_YK_RESPONSE_OK))
+            .await
+            .expect("dual-factor unseal");
+        assert_eq!(state.current_state().await, ServerState::Active);
+    }
+
+    #[tokio::test]
+    async fn dual_factor_unseal_wrong_password_fails() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        state
+            .upgrade_to_dual_factor(
+                "strong-pw-42",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await
+            .expect("upgrade");
+        state.lock().await.expect("lock");
+
+        // Correct YK response, wrong password.
+        let result = state
+            .unseal_dual_factor("wrong-password", &yk_hex(&TEST_YK_RESPONSE_OK))
+            .await;
+        assert!(matches!(result, Err(ApiError::InvalidPassword)));
+        assert_eq!(state.current_state().await, ServerState::Sealed);
+    }
+
+    #[tokio::test]
+    async fn dual_factor_unseal_wrong_yk_response_fails() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        state
+            .upgrade_to_dual_factor(
+                "strong-pw-42",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await
+            .expect("upgrade");
+        state.lock().await.expect("lock");
+
+        // Correct password, wrong YK response.
+        let result = state
+            .unseal_dual_factor("strong-pw-42", &yk_hex(&TEST_YK_RESPONSE_BAD))
+            .await;
+        assert!(matches!(result, Err(ApiError::InvalidPassword)));
+        assert_eq!(state.current_state().await, ServerState::Sealed);
+    }
+
+    #[tokio::test]
+    async fn dual_factor_unseal_errors_when_not_enrolled() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        // Single-factor init, no dual enrollment.
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        state.lock().await.expect("lock");
+
+        // Attempt dual-factor unseal — should report "not configured"
+        // rather than silently falling back or returning InvalidPassword.
+        let result = state
+            .unseal_dual_factor("strong-pw-42", &yk_hex(&TEST_YK_RESPONSE_OK))
+            .await;
+        assert!(result.is_err());
+        let err_text = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_text.contains("dual-factor unseal not configured"),
+            "error must name the missing enrollment, got: {err_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_factor_unseal_rejects_non_hex_response() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        state
+            .upgrade_to_dual_factor(
+                "strong-pw-42",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await
+            .expect("upgrade");
+        state.lock().await.expect("lock");
+
+        let result = state
+            .unseal_dual_factor("strong-pw-42", "not-hex-at-all")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn dual_factor_unseal_rejects_wrong_length_response() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        state
+            .upgrade_to_dual_factor(
+                "strong-pw-42",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await
+            .expect("upgrade");
+        state.lock().await.expect("lock");
+
+        // 10 bytes instead of 20.
+        let result = state
+            .unseal_dual_factor("strong-pw-42", "aabbccddeeff00112233")
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn finalize_dual_factor_deletes_old_blobs() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        state
+            .upgrade_to_dual_factor(
+                "strong-pw-42",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await
+            .expect("upgrade");
+        assert!(state.keystore.has_password_unseal());
+        assert!(state.keystore.has_dual_factor_unseal());
+
+        state
+            .finalize_dual_factor_migration()
+            .await
+            .expect("finalize");
+
+        // Dual-factor blob remains; single-factor blobs are gone.
+        assert!(state.keystore.has_dual_factor_unseal());
+        assert!(!state.keystore.has_password_unseal());
+        assert!(!state.keystore.has_yubikey_unseal());
+    }
+
+    #[tokio::test]
+    async fn dual_factor_unseal_after_finalize_still_works() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        state
+            .upgrade_to_dual_factor(
+                "strong-pw-42",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await
+            .expect("upgrade");
+        state
+            .finalize_dual_factor_migration()
+            .await
+            .expect("finalize");
+        state.lock().await.expect("lock");
+
+        // Single-factor blob is gone; only the dual-factor path is
+        // possible now.
+        state
+            .unseal_dual_factor("strong-pw-42", &yk_hex(&TEST_YK_RESPONSE_OK))
+            .await
+            .expect("dual-factor unseal after finalize");
+        assert_eq!(state.current_state().await, ServerState::Active);
+    }
+
+    #[tokio::test]
+    async fn upgrade_fails_when_sealed() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+        state.lock().await.expect("lock");
+
+        let result = state
+            .upgrade_to_dual_factor(
+                "strong-pw-42",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn upgrade_rejects_wrong_password() {
+        let tmp = TempDir::new().unwrap();
+        let state = make_state(&tmp);
+
+        state
+            .unseal_password("strong-pw-42")
+            .await
+            .expect("initial unseal");
+
+        // Admin-token holder who tries to rotate with the wrong password
+        // must be rejected even though the server is Active.
+        let result = state
+            .upgrade_to_dual_factor(
+                "wrong-password",
+                &TEST_YK_CHALLENGE,
+                &yk_hex(&TEST_YK_RESPONSE_OK),
+            )
+            .await;
+        assert!(matches!(result, Err(ApiError::InvalidPassword)));
+        // No blob was written.
+        assert!(!state.keystore.has_dual_factor_unseal());
     }
 
     #[tokio::test]

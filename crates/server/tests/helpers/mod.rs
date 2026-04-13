@@ -45,6 +45,7 @@ impl TestServer {
             dead_man_timeout_secs: 0, // Disable dead man's switch in tests.
             admin_token: Some(admin_token_b64.clone()),
             lock_pin: lock_pin.map(|s| s.to_string()),
+            require_dual_factor: false,
         };
 
         let state = Arc::new(AppState::new(config).expect("failed to create AppState"));
@@ -197,5 +198,65 @@ impl TestServer {
             .send()
             .await
             .expect("admin_token request failed")
+    }
+
+    // -----------------------------------------------------------------------
+    // v0.1.7 dual-factor helpers
+    // -----------------------------------------------------------------------
+
+    /// GET /unseal/challenge — public endpoint, returns the server's
+    /// stored YubiKey challenge hex and the dual-factor status flags.
+    pub async fn get_unseal_challenge(&self) -> Response {
+        self.client
+            .get(format!("{}/unseal/challenge", self.base_url))
+            .send()
+            .await
+            .expect("get_unseal_challenge request failed")
+    }
+
+    /// POST /admin/dual-factor/enroll with the admin token. Caller provides
+    /// the current master password plus the hex challenge and response
+    /// they've driven through their local YubiKey.
+    pub async fn enroll_dual_factor(
+        &self,
+        password: &str,
+        yubikey_challenge_hex: &str,
+        yubikey_response_hex: &str,
+    ) -> Response {
+        self.client
+            .post(format!("{}/admin/dual-factor/enroll", self.base_url))
+            .bearer_auth(&self.admin_token)
+            .json(&serde_json::json!({
+                "password": password,
+                "yubikey_challenge_hex": yubikey_challenge_hex,
+                "yubikey_response_hex": yubikey_response_hex,
+            }))
+            .send()
+            .await
+            .expect("enroll_dual_factor request failed")
+    }
+
+    /// POST /admin/dual-factor/finalize with the admin token.
+    pub async fn finalize_dual_factor(&self) -> Response {
+        self.client
+            .post(format!("{}/admin/dual-factor/finalize", self.base_url))
+            .bearer_auth(&self.admin_token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .expect("finalize_dual_factor request failed")
+    }
+
+    /// POST /unseal with password + client-supplied YubiKey response hex.
+    pub async fn unseal_dual_factor(&self, password: &str, yubikey_response_hex: &str) -> Response {
+        self.client
+            .post(format!("{}/unseal", self.base_url))
+            .json(&serde_json::json!({
+                "password": password,
+                "yubikey_response_hex": yubikey_response_hex,
+            }))
+            .send()
+            .await
+            .expect("unseal_dual_factor request failed")
     }
 }

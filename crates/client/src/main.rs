@@ -94,6 +94,45 @@ enum Command {
         server_url: Option<String>,
     },
 
+    /// Enroll the locally-attached YubiKey as a required second unseal
+    /// factor on the picrypt-server. After a successful enroll, unseal
+    /// requires BOTH the master password AND a touch of this YubiKey
+    /// (or any other YubiKey programmed with the same HMAC-SHA1 secret).
+    ///
+    /// Requires admin token. Leaves the single-factor unseal path in
+    /// place until you separately run `picrypt finalize-dual-factor`
+    /// to commit — this gives you a rollback window if the new path
+    /// is broken for any reason.
+    EnrollDualFactor {
+        /// Master password (insecure — visible in `ps`). Prefer
+        /// --password-file or stdin.
+        #[arg(long)]
+        password: Option<String>,
+        /// File containing the master password (e.g. ~/.fmw)
+        #[arg(long)]
+        password_file: Option<String>,
+        /// Admin token (base64). Also honored via PICRYPT_ADMIN_TOKEN.
+        #[arg(long, env = "PICRYPT_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+        /// Server URL override (default: server_url from client.toml)
+        #[arg(long)]
+        server_url: Option<String>,
+    },
+
+    /// Permanently delete the single-factor master key blobs from the
+    /// server. After this runs, dual-factor is the ONLY unseal path —
+    /// you can't go back to single-factor without re-initializing the
+    /// server from the recovery bundle. Run ONLY after you've verified
+    /// dual-factor unseal works end-to-end.
+    FinalizeDualFactor {
+        /// Admin token (base64). Also honored via PICRYPT_ADMIN_TOKEN.
+        #[arg(long, env = "PICRYPT_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+        /// Server URL override (default: server_url from client.toml)
+        #[arg(long)]
+        server_url: Option<String>,
+    },
+
     /// Create a new VeraCrypt container using the server-managed keyfile
     CreateContainer {
         /// Path for the new container file (e.g. ~/vault.hc)
@@ -238,6 +277,32 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Command::EnrollDualFactor {
+            password,
+            password_file,
+            admin_token,
+            server_url,
+        } => {
+            cmd_enroll_dual_factor(
+                cli.config.as_deref(),
+                password,
+                password_file.as_deref(),
+                admin_token.as_deref(),
+                server_url.as_deref(),
+            )
+            .await?;
+        }
+        Command::FinalizeDualFactor {
+            admin_token,
+            server_url,
+        } => {
+            cmd_finalize_dual_factor(
+                cli.config.as_deref(),
+                admin_token.as_deref(),
+                server_url.as_deref(),
+            )
+            .await?;
+        }
         Command::CreateContainer {
             path,
             size,
@@ -323,8 +388,92 @@ async fn cmd_unseal(
     password: Option<String>,
     yubikey: bool,
 ) -> anyhow::Result<()> {
+    use picrypt_common::{crypto, yubikey as yk};
+
     let client = connection::ServerClient::new(config)?;
 
+    // v0.1.7: consult the challenge endpoint FIRST. If the server is
+    // configured for dual-factor (either required or just available),
+    // we drive the full dual-factor flow. A v0.1.6 server will 404 on
+    // this endpoint, in which case we fall back to the legacy paths.
+    let dual_factor_info = match client.unseal_challenge().await {
+        Ok(info) => Some(info),
+        Err(e) => {
+            // Not a hard failure — a v0.1.6 server doesn't have this
+            // endpoint. Just note it and fall through.
+            tracing::debug!("GET /unseal/challenge failed (legacy server?): {e}");
+            None
+        }
+    };
+
+    if let Some(info) = dual_factor_info {
+        if info.dual_factor_required || (info.dual_factor_available && !yubikey) {
+            // Dual-factor path. `--yubikey` (legacy server-attached mode)
+            // is mutually exclusive with this — if the user explicitly
+            // asked for the legacy path and the server ALSO requires
+            // dual-factor, it's a conflict.
+            if yubikey {
+                anyhow::bail!(
+                    "--yubikey specifies server-attached YubiKey unseal, but this server \
+                     is configured for client-held dual-factor unseal. Drop the --yubikey \
+                     flag and re-run; your local YubiKey will be prompted automatically."
+                );
+            }
+
+            // Decode the stored challenge.
+            let challenge = crypto::hex_decode(&info.challenge_hex)
+                .context("server returned invalid challenge hex")?;
+            if challenge.is_empty() {
+                anyhow::bail!(
+                    "server advertises dual-factor but returned an empty challenge \
+                     (missing yubikey_challenge.bin). Re-enroll via \
+                     `picrypt enroll-dual-factor`."
+                );
+            }
+
+            // Get the password (explicit arg or interactive prompt).
+            let pw = match password {
+                Some(pw) => pw,
+                None => {
+                    eprint!("Unseal password: ");
+                    std::io::stderr().flush()?;
+                    let mut pw = String::new();
+                    std::io::stdin().read_line(&mut pw)?;
+                    let pw = pw.trim_end().to_string();
+                    if pw.is_empty() {
+                        anyhow::bail!("password cannot be empty");
+                    }
+                    pw
+                }
+            };
+
+            // Sanity-check that ykchalresp is around before asking for a touch.
+            if !yk::is_available() {
+                anyhow::bail!(
+                    "`ykchalresp` not found — install yubikey-personalization and \
+                     plug in a YubiKey before retrying. The server requires dual-factor \
+                     unseal and the client cannot compute the HMAC-SHA1 response without \
+                     the local hardware."
+                );
+            }
+
+            eprintln!("Touch your YubiKey to approve unseal...");
+            let response = yk::challenge_response(&challenge).context(
+                "YubiKey challenge-response failed — is a YubiKey plugged in \
+                 with HMAC-SHA1 configured in slot 2?",
+            )?;
+            let response_hex = crypto::hex_encode(&response);
+
+            let resp = client.unseal_dual_factor(&pw, &response_hex).await?;
+            println!("Server unsealed successfully (dual-factor).");
+            println!("  State: {}", resp.state);
+            println!("  Devices: {}", resp.device_count);
+            return Ok(());
+        }
+    }
+
+    // Legacy / single-factor path (v0.1.6 server or v0.1.7 server with
+    // dual-factor not yet enrolled).
     let resp = match (password, yubikey) {
         (Some(pw), true) => client.unseal_both(&pw).await?,
         (Some(pw), false) => client.unseal(&pw).await?,
@@ -415,6 +564,186 @@ async fn cmd_status(config: &ClientConfig) -> anyhow::Result<()> {
             "Volume: {} -> {} [{}]",
             volume.container, volume.mount_point, status
         );
+    }
+
+    Ok(())
+}
+
+/// Read the master password from (in order): explicit --password,
+/// --password-file, piped stdin (only if stdin is NOT a TTY). Mirrors
+/// the logic in cmd_admin_token but factored out so the dual-factor
+/// commands can share it.
+fn resolve_master_password(
+    password_arg: Option<String>,
+    password_file: Option<&str>,
+) -> anyhow::Result<String> {
+    use std::io::IsTerminal;
+    let password = if let Some(path) = password_file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read password file {path}"))?;
+        raw.trim_end_matches(['\n', '\r']).to_string()
+    } else if let Some(pw) = password_arg {
+        pw
+    } else if !std::io::stdin().is_terminal() {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_line(&mut buf)
+            .context("failed to read password from stdin")?;
+        buf.trim_end_matches(['\n', '\r']).to_string()
+    } else {
+        anyhow::bail!("no password provided. Use --password-file, --password, or pipe via stdin");
+    };
+    if password.is_empty() {
+        anyhow::bail!("password is empty");
+    }
+    Ok(password)
+}
+
+/// Build a ServerClient from an explicit server URL + admin token,
+/// bypassing any device-specific auth that might already be in the
+/// client.toml. Used by the dual-factor enroll/finalize commands which
+/// authenticate as admin, not as a registered device.
+fn build_admin_client(
+    server_url: &str,
+    admin_token: &str,
+) -> anyhow::Result<connection::ServerClient> {
+    let cfg = picrypt_client::config::ClientConfig {
+        loaded_from: None,
+        server_url: server_url.trim_end_matches('/').to_string(),
+        fallback_urls: vec![],
+        device_id: None,
+        auth_token: Some(admin_token.to_string()),
+        heartbeat_timeout_secs: 60,
+        heartbeat_interval_secs: 20,
+        sleep_detection: false,
+        volumes: vec![],
+    };
+    connection::ServerClient::new(&cfg)
+}
+
+async fn cmd_enroll_dual_factor(
+    config_path: Option<&str>,
+    password_arg: Option<String>,
+    password_file: Option<&str>,
+    admin_token_arg: Option<&str>,
+    server_url_override: Option<&str>,
+) -> anyhow::Result<()> {
+    use picrypt_common::{crypto, yubikey};
+
+    // Resolve server URL.
+    let server_url = match server_url_override {
+        Some(url) => url.to_string(),
+        None => {
+            let config = load_config(config_path)
+                .context("no --server-url given and no client.toml found")?;
+            config.server_url.clone()
+        }
+    };
+
+    // Resolve admin token.
+    let admin_token = admin_token_arg.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no admin token provided. Use --admin-token or set PICRYPT_ADMIN_TOKEN. \
+             (You can retrieve it via `picrypt admin-token --password-file <path>` \
+             if you've lost it but still know the master password.)"
+        )
+    })?;
+
+    // Resolve master password.
+    let password = resolve_master_password(password_arg, password_file)?;
+
+    // Sanity-check that a YubiKey is reachable before we bother the server.
+    if !yubikey::is_available() {
+        anyhow::bail!(
+            "`ykchalresp` not found in PATH — install yubikey-personalization \
+             (brew install ykpers on macOS, apt install yubikey-personalization on Linux) \
+             and plug in a YubiKey with HMAC-SHA1 configured in slot 2 before retrying"
+        );
+    }
+
+    // Generate a fresh 32-byte challenge and drive the local YubiKey.
+    eprintln!("[1/3] generating 32-byte challenge...");
+    let challenge = yubikey::generate_challenge();
+    let challenge_hex = crypto::hex_encode(&challenge);
+    eprintln!("      challenge: {challenge_hex}");
+
+    eprintln!("[2/3] touch your YubiKey now (slot 2 HMAC-SHA1 challenge-response)...");
+    let response = yubikey::challenge_response(&challenge).context(
+        "YubiKey challenge-response failed — is a YubiKey plugged in \
+         with HMAC-SHA1 configured in slot 2?",
+    )?;
+    let response_hex = crypto::hex_encode(&response);
+    eprintln!("      response: 20 bytes received ({})", &response_hex[..8]);
+
+    // POST to the enroll endpoint as admin.
+    eprintln!("[3/3] POST /admin/dual-factor/enroll on {server_url}...");
+    let client = build_admin_client(&server_url, admin_token)?;
+    let resp = client
+        .enroll_dual_factor(&password, &challenge_hex, &response_hex)
+        .await
+        .context("enroll request failed")?;
+
+    println!();
+    println!("dual-factor enrollment complete.");
+    println!("  server state: {}", resp.state);
+    if resp.single_factor_still_present {
+        println!("  single-factor blob: still present (not yet finalized)");
+        println!();
+        println!("Next steps:");
+        println!("  1. Test dual-factor unseal from a locked server:");
+        println!("       picrypt lock              # panic-lock the server");
+        println!("       picrypt unseal            # should prompt for both password + YubiKey");
+        println!("  2. Once you've verified dual-factor unseal works, finalize:");
+        println!("       picrypt finalize-dual-factor");
+        println!("     This deletes the single-factor blobs permanently.");
+    } else {
+        println!("  single-factor blob: already gone (finalized)");
+    }
+
+    Ok(())
+}
+
+async fn cmd_finalize_dual_factor(
+    config_path: Option<&str>,
+    admin_token_arg: Option<&str>,
+    server_url_override: Option<&str>,
+) -> anyhow::Result<()> {
+    // Resolve server URL.
+    let server_url = match server_url_override {
+        Some(url) => url.to_string(),
+        None => {
+            let config = load_config(config_path)
+                .context("no --server-url given and no client.toml found")?;
+            config.server_url.clone()
+        }
+    };
+
+    let admin_token = admin_token_arg.ok_or_else(|| {
+        anyhow::anyhow!("no admin token provided. Use --admin-token or set PICRYPT_ADMIN_TOKEN")
+    })?;
+
+    eprintln!("POST /admin/dual-factor/finalize on {server_url}...");
+    eprintln!("WARNING: this deletes the single-factor master key blobs on the server.");
+    eprintln!("         Dual-factor will be the ONLY unseal path after this runs.");
+    eprintln!("         Make sure you have verified dual-factor unseal works first.");
+    eprintln!();
+
+    let client = build_admin_client(&server_url, admin_token)?;
+    let resp = client
+        .finalize_dual_factor()
+        .await
+        .context("finalize request failed")?;
+
+    println!("finalize complete.");
+    println!("  server state: {}", resp.state);
+    println!(
+        "  dual-factor only: {}",
+        if resp.dual_factor_only { "YES" } else { "NO" }
+    );
+    if !resp.dual_factor_only {
+        println!();
+        println!("WARNING: server still has a single-factor unseal path available.");
+        println!("         This is unexpected — inspect the server data dir directly.");
     }
 
     Ok(())

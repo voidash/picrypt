@@ -196,6 +196,38 @@ pub fn derive_key_fast(input: &[u8], context: &[u8]) -> Result<[u8; 32]> {
     Ok(output)
 }
 
+/// Domain-separation context for combining a password-derived key with a
+/// YubiKey-response-derived key into a single dual-factor wrapping key.
+/// Bumping this string invalidates every existing dual-factor blob — only
+/// change it if you mean to force a re-enrollment.
+const DUAL_FACTOR_KDF_CONTEXT: &[u8] = b"picrypt-dual-factor-v1";
+
+/// Combine a 32-byte password-derived key and a 32-byte YubiKey-response-
+/// derived key into a single 32-byte wrapping key for the dual-factor
+/// master-key blob.
+///
+/// Both inputs are required: changing either produces a different wrapping
+/// key, which in turn makes AES-GCM decryption of the dual-factor blob
+/// fail with a tag mismatch. That is the cryptographic mechanism that
+/// enforces "both factors must be correct."
+///
+/// The design deliberately reuses [`derive_key_fast`] — the same low-cost
+/// Argon2id primitive used to expand the YubiKey HMAC response. Both inputs
+/// are already high-entropy 32-byte values, so we do not need the
+/// expensive [`derive_master_key`] parameters here; the fast KDF is purely
+/// for bit-mixing and domain separation.
+///
+/// The returned array is not automatically zeroized — the caller is
+/// responsible for zeroizing it after use.
+pub fn derive_dual_factor_key(pw_key: &[u8; 32], yk_key: &[u8; 32]) -> Result<[u8; 32]> {
+    let mut combined_input = [0u8; 64];
+    combined_input[..32].copy_from_slice(pw_key);
+    combined_input[32..].copy_from_slice(yk_key);
+    let result = derive_key_fast(&combined_input, DUAL_FACTOR_KDF_CONTEXT);
+    combined_input.zeroize();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +388,126 @@ mod tests {
         let k1 = derive_key_fast(b"input-alpha", context).expect("derivation 1 failed");
         let k2 = derive_key_fast(b"input-bravo", context).expect("derivation 2 failed");
         assert_ne!(k1, k2, "different inputs must produce different keys");
+    }
+
+    // -----------------------------------------------------------------------
+    // dual-factor wrapping key combiner (v0.1.7)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dual_factor_key_is_deterministic() {
+        let pw = [0xAAu8; 32];
+        let yk = [0xBBu8; 32];
+        let k1 = derive_dual_factor_key(&pw, &yk).expect("derive #1");
+        let k2 = derive_dual_factor_key(&pw, &yk).expect("derive #2");
+        assert_eq!(k1, k2, "same inputs must produce identical dual-factor key");
+    }
+
+    #[test]
+    fn dual_factor_key_sensitive_to_password_key() {
+        let yk = [0xBBu8; 32];
+        let pw1 = [0xAAu8; 32];
+        let mut pw2 = pw1;
+        pw2[0] ^= 0x01; // flip a single bit
+
+        let k1 = derive_dual_factor_key(&pw1, &yk).expect("derive #1");
+        let k2 = derive_dual_factor_key(&pw2, &yk).expect("derive #2");
+        assert_ne!(
+            k1, k2,
+            "a 1-bit change in the password-derived key must change the dual-factor key"
+        );
+    }
+
+    #[test]
+    fn dual_factor_key_sensitive_to_yubikey_key() {
+        let pw = [0xAAu8; 32];
+        let yk1 = [0xBBu8; 32];
+        let mut yk2 = yk1;
+        yk2[31] ^= 0x80; // flip the high bit of the last byte
+
+        let k1 = derive_dual_factor_key(&pw, &yk1).expect("derive #1");
+        let k2 = derive_dual_factor_key(&pw, &yk2).expect("derive #2");
+        assert_ne!(
+            k1, k2,
+            "a 1-bit change in the yubikey-derived key must change the dual-factor key"
+        );
+    }
+
+    #[test]
+    fn dual_factor_key_order_matters() {
+        // If we ever accidentally made the combiner commutative
+        // (e.g. XOR instead of ordered concat), this test would catch it.
+        let pw = [0xAAu8; 32];
+        let yk = [0xBBu8; 32];
+
+        let normal = derive_dual_factor_key(&pw, &yk).expect("normal order");
+        let swapped = derive_dual_factor_key(&yk, &pw).expect("swapped order");
+        assert_ne!(
+            normal, swapped,
+            "swapping (pw, yk) arguments must change the output — otherwise the combiner is commutative, which risks subtle attacks"
+        );
+    }
+
+    #[test]
+    fn dual_factor_key_round_trip_via_aes_gcm() {
+        // End-to-end: derive a dual-factor key, encrypt a fake master key
+        // under it, decrypt it back. This is the shape of the actual
+        // encrypted_master_key_pw_yk.bin blob we'll be writing.
+        let pw = [0x11u8; 32];
+        let yk = [0x22u8; 32];
+        let fake_master_key = [0xDEu8; 32];
+
+        let wrapping = derive_dual_factor_key(&pw, &yk).expect("derive wrap key");
+        let encrypted = encrypt(&fake_master_key, &wrapping).expect("encrypt");
+        let decrypted = decrypt(&encrypted, &wrapping).expect("decrypt");
+        assert_eq!(
+            decrypted.as_slice(),
+            &fake_master_key[..],
+            "round-trip through dual-factor wrapping key must return original bytes"
+        );
+    }
+
+    #[test]
+    fn dual_factor_key_wrong_pw_key_fails_decrypt() {
+        // If the password-derived key is wrong at unseal time, AES-GCM
+        // should reject with tag mismatch — that's the user-visible
+        // "wrong password" error in the dual-factor unseal path.
+        let pw_correct = [0x11u8; 32];
+        let yk = [0x22u8; 32];
+        let fake_master_key = [0xDEu8; 32];
+
+        let wrap_correct = derive_dual_factor_key(&pw_correct, &yk).expect("derive wrap #1");
+        let encrypted = encrypt(&fake_master_key, &wrap_correct).expect("encrypt");
+
+        let mut pw_wrong = pw_correct;
+        pw_wrong[0] ^= 0xFF;
+        let wrap_wrong = derive_dual_factor_key(&pw_wrong, &yk).expect("derive wrap #2");
+
+        let result = decrypt(&encrypted, &wrap_wrong);
+        assert!(
+            result.is_err(),
+            "decryption with a wrap key derived from the wrong password must fail"
+        );
+    }
+
+    #[test]
+    fn dual_factor_key_wrong_yk_key_fails_decrypt() {
+        let pw = [0x11u8; 32];
+        let yk_correct = [0x22u8; 32];
+        let fake_master_key = [0xDEu8; 32];
+
+        let wrap_correct = derive_dual_factor_key(&pw, &yk_correct).expect("derive wrap #1");
+        let encrypted = encrypt(&fake_master_key, &wrap_correct).expect("encrypt");
+
+        let mut yk_wrong = yk_correct;
+        yk_wrong[17] ^= 0x42;
+        let wrap_wrong = derive_dual_factor_key(&pw, &yk_wrong).expect("derive wrap #2");
+
+        let result = decrypt(&encrypted, &wrap_wrong);
+        assert!(
+            result.is_err(),
+            "decryption with a wrap key derived from the wrong yubikey response must fail"
+        );
     }
 
     #[test]

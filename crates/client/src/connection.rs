@@ -2,8 +2,9 @@ use anyhow::Context;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 
 use picrypt_common::protocol::{
+    EnrollDualFactorRequest, EnrollDualFactorResponse, FinalizeDualFactorResponse,
     HeartbeatResponse, KeyResponse, LockResponse, Platform, RegisterDeviceRequest,
-    RegisterDeviceResponse, UnsealRequest, UnsealResponse,
+    RegisterDeviceResponse, UnsealChallengeResponse, UnsealRequest, UnsealResponse,
 };
 
 use crate::config::ClientConfig;
@@ -80,15 +81,17 @@ impl ServerClient {
         let body = UnsealRequest {
             password: Some(password.to_string()),
             yubikey: false,
+            yubikey_response_hex: None,
         };
         self.post_json("/unseal", &body).await
     }
 
-    /// POST /unseal — unseal with YubiKey only.
+    /// POST /unseal — unseal with YubiKey only (YubiKey attached to server).
     pub async fn unseal_yubikey(&self) -> anyhow::Result<UnsealResponse> {
         let body = UnsealRequest {
             password: None,
             yubikey: true,
+            yubikey_response_hex: None,
         };
         self.post_json("/unseal", &body).await
     }
@@ -98,8 +101,59 @@ impl ServerClient {
         let body = UnsealRequest {
             password: Some(password.to_string()),
             yubikey: true,
+            yubikey_response_hex: None,
         };
         self.post_json("/unseal", &body).await
+    }
+
+    /// POST /unseal — v0.1.7 dual-factor unseal with client-computed YubiKey
+    /// response. The caller must have already driven a YubiKey through
+    /// HMAC-SHA1 challenge-response locally against the challenge served by
+    /// `GET /unseal/challenge`.
+    pub async fn unseal_dual_factor(
+        &self,
+        password: &str,
+        yubikey_response_hex: &str,
+    ) -> anyhow::Result<UnsealResponse> {
+        let body = UnsealRequest {
+            password: Some(password.to_string()),
+            yubikey: false,
+            yubikey_response_hex: Some(yubikey_response_hex.to_string()),
+        };
+        self.post_json("/unseal", &body).await
+    }
+
+    /// GET /unseal/challenge — fetch the server's stored YubiKey challenge
+    /// so the client can compute the HMAC-SHA1 response locally.
+    pub async fn unseal_challenge(&self) -> anyhow::Result<UnsealChallengeResponse> {
+        self.get_json("/unseal/challenge").await
+    }
+
+    /// POST /admin/dual-factor/enroll — admin-gated. Upload a client-
+    /// generated challenge + the YubiKey's response to bind dual-factor
+    /// unseal to the server. Requires the admin token (set on the client
+    /// via `auth_token` at the time this ServerClient was built) and the
+    /// current master password.
+    pub async fn enroll_dual_factor(
+        &self,
+        password: &str,
+        yubikey_challenge_hex: &str,
+        yubikey_response_hex: &str,
+    ) -> anyhow::Result<EnrollDualFactorResponse> {
+        let body = EnrollDualFactorRequest {
+            password: password.to_string(),
+            yubikey_challenge_hex: yubikey_challenge_hex.to_string(),
+            yubikey_response_hex: yubikey_response_hex.to_string(),
+        };
+        self.post_json("/admin/dual-factor/enroll", &body).await
+    }
+
+    /// POST /admin/dual-factor/finalize — admin-gated. Deletes the old
+    /// single-factor blobs on the server. Run ONLY after you have verified
+    /// dual-factor unseal works end-to-end; this is a one-way door.
+    pub async fn finalize_dual_factor(&self) -> anyhow::Result<FinalizeDualFactorResponse> {
+        self.post_json("/admin/dual-factor/finalize", &serde_json::json!({}))
+            .await
     }
 
     /// POST /lock — send panic lock signal. Sends to ALL servers (not just first).

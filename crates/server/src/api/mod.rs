@@ -34,6 +34,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/devices/register", post(devices::register))
         .route("/devices", get(devices::list))
         .route("/devices/{device_id}/revoke", post(devices::revoke))
+        .route(
+            "/admin/dual-factor/enroll",
+            post(unseal::enroll_dual_factor),
+        )
+        .route(
+            "/admin/dual-factor/finalize",
+            post(unseal::finalize_dual_factor),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
@@ -43,6 +51,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let public = Router::new()
         .route("/heartbeat", get(heartbeat::heartbeat))
         .route("/unseal", post(unseal::unseal))
+        .route("/unseal/challenge", get(unseal::challenge))
         .route("/lock", post(lock::lock))
         .route("/admin-token", post(admin_token::admin_token));
 

@@ -61,6 +61,39 @@ impl KeyStore {
         self.read_file_optional("encrypted_master_key_yk.bin")
     }
 
+    /// Save the master key encrypted with a dual-factor-derived key
+    /// (blake-combined password key + YubiKey response key). v0.1.7+.
+    pub fn save_encrypted_master_key_dual(&self, encrypted: &[u8]) -> Result<(), PicryptError> {
+        self.write_file("encrypted_master_key_pw_yk.bin", encrypted)
+    }
+
+    /// Load the dual-factor-encrypted master key blob, if it exists.
+    pub fn load_encrypted_master_key_dual(&self) -> Result<Option<Vec<u8>>, PicryptError> {
+        self.read_file_optional("encrypted_master_key_pw_yk.bin")
+    }
+
+    /// Permanently delete the dual-factor blob. Used as the last step of
+    /// dual-factor setup when we want to fall back to single-factor —
+    /// rare, mostly an escape hatch for botched migrations.
+    pub fn delete_encrypted_master_key_dual(&self) -> Result<(), PicryptError> {
+        self.delete_file_if_exists("encrypted_master_key_pw_yk.bin")
+    }
+
+    /// Permanently delete the password-only blob. Used as the final step
+    /// of dual-factor migration: once `encrypted_master_key_pw_yk.bin`
+    /// exists and unseal has been verified, remove the single-factor
+    /// password blob so that `require_dual_factor = true` is enforced
+    /// physically on disk as well as in config.
+    pub fn delete_encrypted_master_key_password(&self) -> Result<(), PicryptError> {
+        self.delete_file_if_exists("encrypted_master_key_pw.bin")
+    }
+
+    /// Permanently delete the YubiKey-only blob (single-factor YubiKey
+    /// unseal). Mirror of the password variant above.
+    pub fn delete_encrypted_master_key_yubikey(&self) -> Result<(), PicryptError> {
+        self.delete_file_if_exists("encrypted_master_key_yk.bin")
+    }
+
     /// Save the YubiKey challenge.
     pub fn save_yubikey_challenge(&self, challenge: &[u8]) -> Result<(), PicryptError> {
         self.write_file("yubikey_challenge.bin", challenge)
@@ -186,9 +219,20 @@ impl KeyStore {
     // -----------------------------------------------------------------------
 
     /// Server is initialized if at least one encrypted master key exists.
+    /// Must check **all three** possible blobs (password, yubikey, dual-
+    /// factor) — missing the dual-factor blob here would mean that a
+    /// server where single-factor blobs have been deleted (via
+    /// `finalize_dual_factor_migration`) looks "uninitialized" to the
+    /// first-time-setup branch of unseal_password, and that branch would
+    /// then generate a NEW random master key and silently orphan all
+    /// existing device records. That's data loss. So: any of the three.
     pub fn is_initialized(&self) -> bool {
         self.data_dir.join("encrypted_master_key_pw.bin").exists()
             || self.data_dir.join("encrypted_master_key_yk.bin").exists()
+            || self
+                .data_dir
+                .join("encrypted_master_key_pw_yk.bin")
+                .exists()
     }
 
     /// Check if password-based unseal is available.
@@ -199,6 +243,16 @@ impl KeyStore {
     /// Check if YubiKey-based unseal is available.
     pub fn has_yubikey_unseal(&self) -> bool {
         self.data_dir.join("encrypted_master_key_yk.bin").exists()
+    }
+
+    /// Check if dual-factor (password + YubiKey both required) unseal is
+    /// available. When this returns true the server can route unseal
+    /// requests carrying both a password and a yubikey_response_hex
+    /// through `unseal_dual_factor`.
+    pub fn has_dual_factor_unseal(&self) -> bool {
+        self.data_dir
+            .join("encrypted_master_key_pw_yk.bin")
+            .exists()
     }
 
     // -----------------------------------------------------------------------
@@ -234,6 +288,16 @@ impl KeyStore {
             PicryptError::Storage(format!("failed to read {}: {e}", path.display()))
         })?;
         Ok(Some(data))
+    }
+
+    fn delete_file_if_exists(&self, name: &str) -> Result<(), PicryptError> {
+        let path = self.data_dir.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                PicryptError::Storage(format!("failed to delete {}: {e}", path.display()))
+            })?;
+        }
+        Ok(())
     }
 }
 

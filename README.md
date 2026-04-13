@@ -179,7 +179,7 @@ lock PIN inside the app, then add the widget to your home screen. Tap → confir
 
 | Component | Where the key lives |
 |---|---|
-| Master key at rest | `master_key.enc` on the server's disk, encrypted with Argon2id-derived key from the operator's password (AES-256-GCM) |
+| Master key at rest | `encrypted_master_key_pw.bin` (single-factor) or `encrypted_master_key_pw_yk.bin` (v0.1.7+ dual-factor) on the server's disk, encrypted with an Argon2id-derived key from the operator's password — and, in dual-factor mode, combined with the operator's YubiKey HMAC-SHA1 response. AES-256-GCM for the outer wrap. |
 | Master key when active | mlock'd in server RAM, zeroized on lock/seal |
 | Per-device keyfiles | Generated on registration, stored encrypted under the master key |
 | Keyfile in transit | HTTPS over Tailscale (WireGuard + Noise; mutual auth via Tailscale ACLs) |
@@ -190,10 +190,89 @@ lock PIN inside the app, then add the widget to your home screen. Tap → confir
 | Rate limiting | Sliding-window per-IP for unseal/lock attempts |
 | Bootstrap protection | Admin token cannot be issued without first unsealing |
 | PIN handling | Constant-time comparison; length checked before content |
+| Dual-factor unseal (v0.1.7+) | Requires BOTH master password AND a YubiKey HMAC-SHA1 response at every unseal. The YubiKey lives on the client box; the server never touches the hardware. Defeats coercion scenarios where only the password is extracted. |
 
 The server has **no Internet egress requirement** and **no DNS resolution**.
 Configure your tailnet ACL so only the laptops you care about can hit it on
 port 7123.
+
+## Dual-factor unseal (v0.1.7+)
+
+By default, picrypt unseals with only a master password. If coercion resistance
+matters to you — i.e. "someone might force me to hand over the password" —
+enable dual-factor unseal: every unseal then requires **both** the master
+password and a touch of a YubiKey that you keep physically separated from
+the server.
+
+**How the crypto works.** At enrollment, the server picks a combined wrapping
+key by running `SHA-256-family-of-KDF(pw_key || yk_key)` where `pw_key` is the
+Argon2id-derived password key and `yk_key` is an Argon2id expansion of the
+YubiKey's 20-byte HMAC-SHA1 response. The master key is re-encrypted under
+this combined key. Decryption — and therefore unseal — requires **both**
+inputs to be correct. Missing either one produces a different combined key
+and AES-GCM tag verification fails. There is no partial-derive path.
+
+**Enrollment ceremony** (do this on your trusted workstation with a YubiKey
+plugged in):
+
+```bash
+# 1. Program a 20-byte HMAC-SHA1 secret into YubiKey slot 2.
+#    Save the hex secret to paper/safe — this is your recovery material.
+openssl rand -hex 20
+# → a1b2c3d4e5f67890abcdef0123456789abcdef01   (example)
+
+ykman otp chalresp --touch 2 a1b2c3d4e5f67890abcdef0123456789abcdef01
+
+# 2. Verify: challenge-response should produce the same 20 bytes
+#    that HMAC-SHA1(secret, challenge) produces in software.
+CHALLENGE=$(openssl rand -hex 32)
+ykchalresp -2 -H -x "$CHALLENGE"
+# Cross-check against:
+# python3 -c 'import hmac,hashlib; print(hmac.new(bytes.fromhex("a1b2c3..."), bytes.fromhex("'$CHALLENGE'"), hashlib.sha1).hexdigest())'
+
+# 3. If you want multiple YubiKeys (recommended), program each with
+#    the SAME secret so any of them can unseal:
+ykman otp chalresp --touch 2 a1b2c3d4e5f67890abcdef0123456789abcdef01
+
+# 4. Enroll against the server. You need the admin token + master password.
+picrypt enroll-dual-factor \
+    --admin-token "$(cat ~/admin-token.txt)" \
+    --password-file ~/.master-password
+
+# 5. Test the new path. Lock the server, then unseal — you'll be
+#    prompted for both the password and a YubiKey touch.
+picrypt panic --pin <your-lock-pin>
+picrypt unseal
+
+# 6. Once you're sure dual-factor works, finalize to delete the old
+#    single-factor blob from the server. This is a one-way door.
+picrypt finalize-dual-factor
+```
+
+**Paper backup.** The 20-byte secret you generated in step 1 IS your recovery
+material. Store it somewhere safe (paper in a fireproof safe, password manager,
+etched into a metal plate, whatever). If every YubiKey you programmed is lost
+AND you have the paper, you can still recover: the offline recovery script
+(`picrypt-offline-recover.py`, in the `master-omv/` bundle) accepts a
+`--yk-secret-file` flag and reconstructs the HMAC-SHA1 response in software.
+You do not need working YubiKey hardware to recover from paper. You do not
+need the picrypt-server to recover — just the master password, the paper
+secret, and the server's `data/` directory (or the backup of it).
+
+**What dual-factor does NOT protect against.**
+
+- **Attacker who reaches the YubiKey AND the master password.** If both are in
+  the same room when the attacker arrives, dual-factor buys you nothing. The
+  whole point is physical separation — keep the YubiKey somewhere the
+  password-extractor can't touch.
+- **Attacker with root on the running server during Active state.** The
+  combined key is in server RAM while the server is unsealed. A memory dump
+  yields everything. Dual-factor protects the transition *into* Active, not
+  the Active state itself.
+- **Lost paper backup AND lost all YubiKeys.** If both are gone, the data
+  directory's dual-factor blob is unrecoverable. This is by design — it's what
+  makes dual-factor meaningful — but it means you MUST have at least one
+  working factor at all times.
 
 ---
 

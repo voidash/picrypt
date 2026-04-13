@@ -29,6 +29,19 @@ pub struct ServerConfig {
     /// request body. If unset, lock is unauthenticated (for panic scenarios
     /// where any device on the network should be able to trigger lock).
     pub lock_pin: Option<String>,
+
+    /// v0.1.7+: if true, the server rejects single-factor unseal attempts
+    /// and only accepts dual-factor unseal (password + YubiKey response).
+    /// The dual-factor blob (`encrypted_master_key_pw_yk.bin`) must exist
+    /// on disk for this mode to be functional; enabling this flag without
+    /// a dual-factor blob will cause every unseal attempt to fail at the
+    /// "not configured" check.
+    ///
+    /// Defaults to false so existing deployments continue to work with
+    /// password-only unseal until the operator explicitly enrolls dual
+    /// factor via `picrypt admin enroll-dual-factor` and flips this flag.
+    #[serde(default)]
+    pub require_dual_factor: bool,
 }
 
 impl ServerConfig {
@@ -68,6 +81,7 @@ impl Default for ServerConfig {
             dead_man_timeout_secs: default_dead_man_timeout(),
             admin_token: None,
             lock_pin: None,
+            require_dual_factor: false,
         }
     }
 }

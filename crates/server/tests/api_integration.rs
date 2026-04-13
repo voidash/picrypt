@@ -380,3 +380,186 @@ async fn admin_token_endpoint_uninitialized_errors() {
         resp.status()
     );
 }
+
+// ---------------------------------------------------------------------------
+// v0.1.7 dual-factor unseal
+//
+// These tests fake the YubiKey by passing a deterministic 20-byte
+// "response" hex. The server doesn't know or care that it's not from
+// real hardware — it Argon2id-expands the 20 bytes into the dual-factor
+// wrapping key whether they came from ykchalresp or from a test fixture.
+// ---------------------------------------------------------------------------
+
+const TEST_YK_CHALLENGE_HEX: &str =
+    "ad7c1236c65101fb9740579f9e34c533e251ed11464346bed85d75e6ea1f0faa";
+const TEST_YK_RESPONSE_OK: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // 20 bytes of 0xAA
+const TEST_YK_RESPONSE_BAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // 20 bytes of 0xBB
+
+#[tokio::test]
+async fn unseal_challenge_before_enrollment_reports_unavailable() {
+    let server = TestServer::start_default().await;
+
+    // Single-factor init so the server has SOMETHING to unseal with later,
+    // but no dual-factor blob yet.
+    server.unseal(TEST_PASSWORD).await;
+
+    let resp = server.get_unseal_challenge().await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["dual_factor_available"], false);
+    assert_eq!(body["dual_factor_required"], false);
+    assert_eq!(body["challenge_hex"], "");
+}
+
+#[tokio::test]
+async fn enroll_dual_factor_success() {
+    let server = TestServer::start_default().await;
+
+    // Init with password, then enroll dual factor.
+    server.unseal(TEST_PASSWORD).await;
+
+    let resp = server
+        .enroll_dual_factor(TEST_PASSWORD, TEST_YK_CHALLENGE_HEX, TEST_YK_RESPONSE_OK)
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "enroll should succeed, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["state"], "active");
+    // Single-factor blob still on disk until finalize.
+    assert_eq!(body["single_factor_still_present"], true);
+
+    // Challenge is now advertised.
+    let challenge_resp = server.get_unseal_challenge().await;
+    let challenge_body: serde_json::Value = challenge_resp.json().await.unwrap();
+    assert_eq!(challenge_body["dual_factor_available"], true);
+    assert_eq!(challenge_body["challenge_hex"], TEST_YK_CHALLENGE_HEX);
+}
+
+#[tokio::test]
+async fn enroll_dual_factor_rejects_wrong_password() {
+    let server = TestServer::start_default().await;
+    server.unseal(TEST_PASSWORD).await;
+
+    let resp = server
+        .enroll_dual_factor("wrong-password", TEST_YK_CHALLENGE_HEX, TEST_YK_RESPONSE_OK)
+        .await;
+    assert!(resp.status().as_u16() >= 400);
+}
+
+#[tokio::test]
+async fn enroll_dual_factor_requires_admin_token() {
+    let server = TestServer::start_default().await;
+    server.unseal(TEST_PASSWORD).await;
+
+    // Bypass the helper to send WITHOUT admin auth.
+    let resp = server
+        .client
+        .post(format!("{}/admin/dual-factor/enroll", server.base_url))
+        .json(&serde_json::json!({
+            "password": TEST_PASSWORD,
+            "yubikey_challenge_hex": TEST_YK_CHALLENGE_HEX,
+            "yubikey_response_hex": TEST_YK_RESPONSE_OK,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn dual_factor_unseal_round_trip() {
+    let server = TestServer::start_default().await;
+
+    // Phase 1: initial password unseal.
+    server.unseal(TEST_PASSWORD).await;
+
+    // Phase 2: enroll dual factor.
+    let enroll = server
+        .enroll_dual_factor(TEST_PASSWORD, TEST_YK_CHALLENGE_HEX, TEST_YK_RESPONSE_OK)
+        .await;
+    assert_eq!(enroll.status().as_u16(), 200);
+
+    // Phase 3: lock.
+    let lock = server.lock(None).await;
+    assert_eq!(lock.status().as_u16(), 200);
+
+    // Phase 4: dual-factor unseal with correct inputs.
+    let resp = server
+        .unseal_dual_factor(TEST_PASSWORD, TEST_YK_RESPONSE_OK)
+        .await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "dual-factor unseal should succeed, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["state"], "active");
+}
+
+#[tokio::test]
+async fn dual_factor_unseal_wrong_password_fails() {
+    let server = TestServer::start_default().await;
+    server.unseal(TEST_PASSWORD).await;
+    server
+        .enroll_dual_factor(TEST_PASSWORD, TEST_YK_CHALLENGE_HEX, TEST_YK_RESPONSE_OK)
+        .await;
+    server.lock(None).await;
+
+    let resp = server
+        .unseal_dual_factor("wrong-password", TEST_YK_RESPONSE_OK)
+        .await;
+    assert!(resp.status().as_u16() >= 400);
+}
+
+#[tokio::test]
+async fn dual_factor_unseal_wrong_yk_response_fails() {
+    let server = TestServer::start_default().await;
+    server.unseal(TEST_PASSWORD).await;
+    server
+        .enroll_dual_factor(TEST_PASSWORD, TEST_YK_CHALLENGE_HEX, TEST_YK_RESPONSE_OK)
+        .await;
+    server.lock(None).await;
+
+    let resp = server
+        .unseal_dual_factor(TEST_PASSWORD, TEST_YK_RESPONSE_BAD)
+        .await;
+    assert!(resp.status().as_u16() >= 400);
+}
+
+#[tokio::test]
+async fn finalize_removes_single_factor_blob() {
+    let server = TestServer::start_default().await;
+    server.unseal(TEST_PASSWORD).await;
+    server
+        .enroll_dual_factor(TEST_PASSWORD, TEST_YK_CHALLENGE_HEX, TEST_YK_RESPONSE_OK)
+        .await;
+
+    let finalize = server.finalize_dual_factor().await;
+    assert_eq!(finalize.status().as_u16(), 200);
+    let body: serde_json::Value = finalize.json().await.unwrap();
+    assert_eq!(body["dual_factor_only"], true);
+
+    // Post-finalize, dual-factor unseal still works after a lock/unseal cycle.
+    server.lock(None).await;
+    let resp = server
+        .unseal_dual_factor(TEST_PASSWORD, TEST_YK_RESPONSE_OK)
+        .await;
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Post-finalize, single-factor unseal should fail because the old
+    // blob is gone. Server will return an error (either from
+    // unseal_password missing the blob, or from require_dual_factor if
+    // it was enabled).
+    server.lock(None).await;
+    let sf_resp = server.unseal(TEST_PASSWORD).await;
+    assert!(
+        sf_resp.status().as_u16() >= 400,
+        "single-factor unseal after finalize should fail, got {}",
+        sf_resp.status()
+    );
+}
