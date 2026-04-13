@@ -368,10 +368,10 @@ async fn cmd_unlock(config: &ClientConfig) -> anyhow::Result<()> {
 async fn cmd_lock(config: &ClientConfig) -> anyhow::Result<()> {
     config.require_registered()?;
 
-    for volume in &config.volumes {
-        match veracrypt::dismount(&volume.mount_point) {
-            Ok(()) => println!("Dismounted: {}", volume.mount_point),
-            Err(e) => eprintln!("Failed to dismount {}: {e}", volume.mount_point),
+    for vol in &config.volumes {
+        match picrypt_client::volume::dismount(vol) {
+            Ok(()) => println!("Dismounted: {}", vol.mount_point),
+            Err(e) => eprintln!("Failed to dismount {}: {e}", vol.mount_point),
         }
     }
 
@@ -503,8 +503,8 @@ async fn cmd_panic_lock(config: &ClientConfig, pin: Option<&str>) -> anyhow::Res
         resp.state, resp.devices_notified
     );
 
-    for volume in &config.volumes {
-        let _ = veracrypt::dismount(&volume.mount_point);
+    for vol in &config.volumes {
+        let _ = picrypt_client::volume::dismount(vol);
     }
 
     println!("All local volumes dismounted.");

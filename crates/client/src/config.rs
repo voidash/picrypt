@@ -49,6 +49,39 @@ pub struct VolumeConfig {
     pub container: String,
     /// Mount point (directory).
     pub mount_point: String,
+
+    /// Optional custom mount command. When set, picrypt skips its
+    /// built-in veracrypt-mount path entirely and runs this command
+    /// instead, passing the keyfile bytes on stdin. This is the escape
+    /// hatch for unusual vault layouts (APFS-inside-veracrypt on macOS,
+    /// ext4-after-veracrypt on Linux, LUKS-in-file, etc.).
+    ///
+    /// Contract:
+    /// - argv:   `mount_command <container> <mount_point>`
+    /// - stdin:  raw keyfile bytes (64-byte binary blob from server)
+    /// - exit 0: success (volume considered mounted; daemon will start
+    ///   heartbeat)
+    /// - exit !=0: failure (stderr shown in picrypt log, heartbeat not
+    ///   started for this volume)
+    ///
+    /// The command receives the keyfile bytes ONCE on stdin and should
+    /// pass them to veracrypt via `--keyfiles=/dev/stdin` or a FIFO; do
+    /// NOT persist the keyfile to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_command: Option<String>,
+
+    /// Optional custom dismount command. When set, picrypt skips its
+    /// built-in veracrypt-dismount path and runs this instead.
+    ///
+    /// Contract:
+    /// - argv:   `dismount_command <container> <mount_point>`
+    /// - stdin:  none (dismount doesn't need the keyfile)
+    /// - exit 0: success (volume considered dismounted)
+    ///
+    /// Should be idempotent — the daemon may call it twice (once on
+    /// heartbeat-timeout, once on final shutdown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismount_command: Option<String>,
 }
 
 impl ClientConfig {
@@ -176,9 +209,11 @@ mod tests {
             heartbeat_timeout_secs: 60,
             heartbeat_interval_secs: 15,
             sleep_detection: false,
-            volumes: vec![VolumeConfig {
+            volumes: vec![crate::config::VolumeConfig {
                 container: "/mnt/vault.hc".to_string(),
                 mount_point: "/mnt/secure".to_string(),
+                mount_command: None,
+                dismount_command: None,
             }],
         };
 

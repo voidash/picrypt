@@ -61,6 +61,8 @@ pub async fn create(
         config.volumes.push(crate::config::VolumeConfig {
             container: path.to_string(),
             mount_point: mp.to_string(),
+            mount_command: None,
+            dismount_command: None,
         });
         config.save()?;
         println!("Added to config: {path} -> {mp}");

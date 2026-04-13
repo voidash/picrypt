@@ -6,4 +6,5 @@ pub mod error;
 pub mod platform;
 pub mod recovery;
 pub mod veracrypt;
+pub mod volume;
 pub mod yubikey_setup;

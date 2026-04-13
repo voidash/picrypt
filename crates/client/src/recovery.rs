@@ -14,7 +14,6 @@ use picrypt_common::crypto;
 use picrypt_common::yubikey;
 
 use crate::config::ClientConfig;
-use crate::veracrypt;
 
 /// Create a YubiKey-encrypted backup of a keyfile.
 ///
@@ -98,17 +97,14 @@ pub fn recover(config: &ClientConfig) -> anyhow::Result<()> {
     println!("Keyfile decrypted. Mounting volumes...");
 
     let mut mounted = 0;
-    for volume in &config.volumes {
-        match veracrypt::mount(&volume.container, &volume.mount_point, &keyfile_bytes) {
+    for vol in &config.volumes {
+        match crate::volume::mount(vol, &keyfile_bytes) {
             Ok(()) => {
-                println!("  Mounted: {} -> {}", volume.container, volume.mount_point);
+                println!("  Mounted: {} -> {}", vol.container, vol.mount_point);
                 mounted += 1;
             }
             Err(e) => {
-                eprintln!(
-                    "  Failed: {} -> {}: {e}",
-                    volume.container, volume.mount_point
-                );
+                eprintln!("  Failed: {} -> {}: {e}", vol.container, vol.mount_point);
             }
         }
     }

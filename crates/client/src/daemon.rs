@@ -10,7 +10,7 @@ use picrypt_common::protocol::{WsClientMessage, WsServerMessage};
 use crate::config::ClientConfig;
 use crate::connection::ServerClient;
 use crate::platform::{self, PlatformEvent};
-use crate::veracrypt;
+use crate::{veracrypt, volume};
 
 /// Run the client daemon: fetch key, mount volumes, maintain heartbeat,
 /// listen for lock signals, and monitor for system sleep.
@@ -32,18 +32,20 @@ pub async fn run(config: &ClientConfig, client: ServerClient) -> anyhow::Result<
         .decode(&key_resp.keyfile)
         .map_err(|e| anyhow::anyhow!("failed to decode keyfile: {e}"))?;
 
-    // Step 2: Mount each configured volume.
+    // Step 2: Mount each configured volume. Dispatches to a custom
+    // `mount_command` if the volume sets one, otherwise falls back to
+    // picrypt's built-in veracrypt integration.
     let mut mounted_count = 0;
-    for volume in &config.volumes {
-        match veracrypt::mount(&volume.container, &volume.mount_point, &keyfile_bytes) {
+    for vol in &config.volumes {
+        match volume::mount(vol, &keyfile_bytes) {
             Ok(()) => {
-                println!("Mounted: {} -> {}", volume.container, volume.mount_point);
+                println!("Mounted: {} -> {}", vol.container, vol.mount_point);
                 mounted_count += 1;
             }
             Err(e) => {
                 eprintln!(
                     "Failed to mount {} -> {}: {e}",
-                    volume.container, volume.mount_point
+                    vol.container, vol.mount_point
                 );
             }
         }
@@ -81,11 +83,15 @@ pub async fn run(config: &ClientConfig, client: ServerClient) -> anyhow::Result<
 }
 
 fn force_dismount_all(config: &ClientConfig) {
-    for volume in &config.volumes {
-        if let Err(e) = veracrypt::dismount(&volume.mount_point) {
-            tracing::error!("failed to dismount {}: {e}", volume.mount_point);
+    for vol in &config.volumes {
+        if let Err(e) = volume::dismount(vol) {
+            tracing::error!("failed to dismount {}: {e}", vol.mount_point);
         }
     }
+    // Nuclear fallback: dismount every remaining veracrypt volume so a
+    // stray one left over from an earlier run doesn't keep the data visible.
+    // This only affects volumes that went through the built-in veracrypt
+    // path; custom-command volumes are already handled above.
     if let Err(e) = veracrypt::dismount_all() {
         tracing::error!("failed to dismount all: {e}");
     }
