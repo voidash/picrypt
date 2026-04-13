@@ -5,7 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite;
 use zeroize::Zeroize;
 
-use picrypt_common::protocol::{WsClientMessage, WsServerMessage};
+use picrypt_common::protocol::{ServerState, WsClientMessage, WsServerMessage};
 
 use crate::config::ClientConfig;
 use crate::connection::ServerClient;
@@ -73,7 +73,7 @@ pub async fn run(config: &ClientConfig, client: ServerClient) -> anyhow::Result<
     };
 
     // Step 4: Run the heartbeat + WebSocket + sleep monitoring loop.
-    let result = heartbeat_loop(config, &auth_token, device_id, &mut sleep_rx).await;
+    let result = heartbeat_loop(config, &auth_token, &client, device_id, &mut sleep_rx).await;
 
     // Step 5: On exit, dismount everything.
     tracing::warn!("daemon stopping — dismounting all volumes");
@@ -100,6 +100,7 @@ fn force_dismount_all(config: &ClientConfig) {
 async fn heartbeat_loop(
     config: &ClientConfig,
     auth_token: &str,
+    client: &ServerClient,
     device_id: uuid::Uuid,
     sleep_rx: &mut Option<tokio::sync::mpsc::Receiver<PlatformEvent>>,
 ) -> anyhow::Result<()> {
@@ -115,6 +116,12 @@ async fn heartbeat_loop(
     let heartbeat_timeout = Duration::from_secs(config.heartbeat_timeout_secs);
     let mut wall_clock = platform::WallClockMonitor::new();
 
+    // Client-side liveness timer. Any successful HTTP probe resets this;
+    // if it exceeds `heartbeat_timeout`, we dismount regardless of WS state.
+    // This is independent of TCP/WebSocket keepalive semantics and is the
+    // one clock that drives dead-man behavior on the client.
+    let mut last_http_success = Instant::now();
+
     loop {
         tracing::info!("connecting WebSocket to {ws_urls}...");
 
@@ -123,11 +130,13 @@ async fn heartbeat_loop(
                 tracing::info!("WebSocket connected");
                 let result = run_ws_loop(
                     ws_stream,
+                    client,
                     device_id,
                     heartbeat_interval,
                     heartbeat_timeout,
                     sleep_rx,
                     &mut wall_clock,
+                    &mut last_http_success,
                 )
                 .await;
 
@@ -138,6 +147,16 @@ async fn heartbeat_loop(
                     }
                     WsLoopResult::ShutdownReceived => {
                         tracing::warn!("server shutting down — dismounting");
+                        return Ok(());
+                    }
+                    WsLoopResult::ServerLocked => {
+                        tracing::warn!("server state is not active — dismounting");
+                        return Ok(());
+                    }
+                    WsLoopResult::HeartbeatTimeout => {
+                        tracing::error!(
+                            "HTTP heartbeat timeout ({heartbeat_timeout:?}) — dismounting"
+                        );
                         return Ok(());
                     }
                     WsLoopResult::SleepDetected => {
@@ -161,13 +180,16 @@ async fn heartbeat_loop(
             }
         }
 
-        // HTTP heartbeat fallback.
+        // HTTP heartbeat fallback — used when the WS can't be established at
+        // all. Once we're back in business we reconnect WS; until then the
+        // HTTP loop drives liveness against `last_http_success`.
         let fallback_result = http_heartbeat_fallback(
-            config,
+            client,
             heartbeat_interval,
             heartbeat_timeout,
             sleep_rx,
             &mut wall_clock,
+            &mut last_http_success,
         )
         .await;
 
@@ -224,24 +246,33 @@ async fn connect_ws(ws_url: &str, auth_token: &str) -> anyhow::Result<WsStream> 
 enum WsLoopResult {
     LockReceived,
     ShutdownReceived,
+    ServerLocked,
+    HeartbeatTimeout,
     SleepDetected,
     Disconnected,
     Error(String),
     CtrlC,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_ws_loop(
     ws_stream: WsStream,
+    client: &ServerClient,
     device_id: uuid::Uuid,
     heartbeat_interval: Duration,
-    _heartbeat_timeout: Duration,
+    heartbeat_timeout: Duration,
     sleep_rx: &mut Option<tokio::sync::mpsc::Receiver<PlatformEvent>>,
     wall_clock: &mut platform::WallClockMonitor,
+    last_http_success: &mut Instant,
 ) -> WsLoopResult {
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
     heartbeat_timer.tick().await;
+
+    // Bound every WS write so a zombie TCP session can't wedge the select
+    // branch for minutes at a time waiting on a kernel-level timeout.
+    let ws_send_timeout = Duration::from_secs(5);
 
     loop {
         // Build a future for sleep events (or a never-completing future if disabled).
@@ -291,12 +322,56 @@ async fn run_ws_loop(
                     return WsLoopResult::SleepDetected;
                 }
 
+                // HTTP liveness probe FIRST. This drives `last_http_success`
+                // — the real dead-man clock. If we skipped this and relied on
+                // WS send alone, a half-open TCP connection (server killed but
+                // kernel hasn't torn the socket down yet) would keep us happy
+                // for ~15 minutes until TCP keepalive finally notices.
+                match client.heartbeat().await {
+                    Ok(resp) if resp.state == ServerState::Active => {
+                        *last_http_success = Instant::now();
+                        tracing::debug!("http heartbeat ok");
+                    }
+                    Ok(resp) => {
+                        tracing::warn!(
+                            "server state is {} (not Active) — treating as locked",
+                            resp.state
+                        );
+                        return WsLoopResult::ServerLocked;
+                    }
+                    Err(e) => {
+                        let elapsed = last_http_success.elapsed();
+                        tracing::warn!(
+                            "http heartbeat probe failed ({e}) — {:.0}s since last success (timeout {}s)",
+                            elapsed.as_secs_f64(),
+                            heartbeat_timeout.as_secs()
+                        );
+                    }
+                }
+
+                if last_http_success.elapsed() >= heartbeat_timeout {
+                    return WsLoopResult::HeartbeatTimeout;
+                }
+
+                // THEN send WS heartbeat so the server's own dead-man gets
+                // touched. Wrapped in a short timeout so a stuck socket
+                // surfaces as a disconnect instead of hanging the select.
                 let msg = WsClientMessage::Heartbeat { device_id };
                 let json = serde_json::to_string(&msg).unwrap_or_default();
-                if ws_tx.send(tungstenite::Message::Text(json.into())).await.is_err() {
-                    return WsLoopResult::Disconnected;
+                let send_fut = ws_tx.send(tungstenite::Message::Text(json.into()));
+                match tokio::time::timeout(ws_send_timeout, send_fut).await {
+                    Ok(Ok(())) => {
+                        tracing::debug!("ws heartbeat sent");
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("ws heartbeat send failed: {e}");
+                        return WsLoopResult::Disconnected;
+                    }
+                    Err(_) => {
+                        tracing::warn!("ws heartbeat send timed out after {ws_send_timeout:?}");
+                        return WsLoopResult::Disconnected;
+                    }
                 }
-                tracing::debug!("heartbeat sent");
             }
 
             event = sleep_event => {
@@ -326,23 +401,15 @@ enum FallbackResult {
 }
 
 async fn http_heartbeat_fallback(
-    config: &ClientConfig,
+    client: &ServerClient,
     poll_interval: Duration,
     timeout: Duration,
     sleep_rx: &mut Option<tokio::sync::mpsc::Receiver<PlatformEvent>>,
     wall_clock: &mut platform::WallClockMonitor,
+    last_http_success: &mut Instant,
 ) -> FallbackResult {
-    let start = Instant::now();
     let mut interval = tokio::time::interval(poll_interval);
     interval.tick().await;
-
-    let client = match crate::connection::ServerClient::new(config) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("failed to create HTTP client for fallback: {e}");
-            return FallbackResult::Timeout;
-        }
-    };
 
     loop {
         let sleep_event = async {
@@ -355,30 +422,30 @@ async fn http_heartbeat_fallback(
 
         tokio::select! {
             _ = interval.tick() => {
-                let elapsed = start.elapsed();
-                if elapsed >= timeout {
-                    return FallbackResult::Timeout;
-                }
-
                 // Check wall clock.
                 if wall_clock.check(poll_interval.as_secs()).is_some() {
                     return FallbackResult::SleepDetected;
                 }
 
                 match client.heartbeat().await {
+                    Ok(resp) if resp.state == ServerState::Active => {
+                        *last_http_success = Instant::now();
+                        return FallbackResult::ServerBack;
+                    }
                     Ok(resp) => {
-                        if resp.state == picrypt_common::protocol::ServerState::Active {
-                            return FallbackResult::ServerBack;
-                        }
                         tracing::warn!("server is {} — treating as lock", resp.state);
                         return FallbackResult::Timeout;
                     }
                     Err(_) => {
+                        let elapsed = last_http_success.elapsed();
                         let remaining = timeout.saturating_sub(elapsed);
                         tracing::debug!(
                             "server unreachable — {:.0}s remaining before dismount",
                             remaining.as_secs_f64()
                         );
+                        if elapsed >= timeout {
+                            return FallbackResult::Timeout;
+                        }
                     }
                 }
             }
