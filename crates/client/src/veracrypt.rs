@@ -253,9 +253,7 @@ pub fn dismount(mount_point: &str) -> anyhow::Result<()> {
     // call it a win. (Happens when a previous run already dismounted and
     // veracrypt now complains "Volume not found".)
     if !is_mounted(mount_point).unwrap_or(true) {
-        tracing::info!(
-            "dismount reported failure but {mount_point} is no longer mounted — OK"
-        );
+        tracing::info!("dismount reported failure but {mount_point} is no longer mounted — OK");
         return Ok(());
     }
 
@@ -281,9 +279,7 @@ pub fn dismount(mount_point: &str) -> anyhow::Result<()> {
     // has no equivalent we can safely invoke here).
     #[cfg(target_os = "linux")]
     {
-        tracing::warn!(
-            "retry also failed — falling back to `umount -l` (lazy) on {mount_point}"
-        );
+        tracing::warn!("retry also failed — falling back to `umount -l` (lazy) on {mount_point}");
         match lazy_umount(mount_point) {
             Ok(()) => {
                 tracing::warn!(
@@ -376,8 +372,7 @@ fn kill_mount_holders(mount_point: &str) {
     use std::time::Duration;
 
     let mount_path = std::path::Path::new(mount_point);
-    let canonical = std::fs::canonicalize(mount_path)
-        .unwrap_or_else(|_| mount_path.to_path_buf());
+    let canonical = std::fs::canonicalize(mount_path).unwrap_or_else(|_| mount_path.to_path_buf());
 
     let pids = find_mount_holder_pids(&canonical);
     if pids.is_empty() {
