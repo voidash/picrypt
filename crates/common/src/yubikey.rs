@@ -33,12 +33,22 @@ pub fn generate_challenge() -> Vec<u8> {
 /// configured in slot 2 to be physically connected.
 ///
 /// Returns the 20-byte HMAC-SHA1 response.
+///
+/// IMPORTANT: we pass `-x` so ykchalresp decodes `challenge_hex` as hex
+/// bytes before sending to the YubiKey. Without `-x`, ykchalresp treats
+/// the challenge argument as raw ASCII — i.e. it would HMAC over the
+/// ASCII characters of the hex string rather than over the decoded
+/// binary bytes. That bug (shipped up through v0.1.4) made picrypt's
+/// backup/recover internally self-consistent but impossible to verify
+/// with external HMAC tools, breaking the "txt-file fallback" recovery
+/// path documented in RECOVERY.md.
 pub fn challenge_response(challenge: &[u8]) -> Result<Vec<u8>> {
     let challenge_hex = crypto::hex_encode(challenge);
 
-    // Try `ykchalresp` first (from yubikey-personalization package).
+    // `-2` = slot 2, `-H` = HMAC mode (64-byte HMAC challenge — the default),
+    // `-x` = the challenge argument is HEX-ENCODED (must be paired with -H).
     let output = Command::new("ykchalresp")
-        .args(["-2", "-H", &challenge_hex])
+        .args(["-2", "-H", "-x", &challenge_hex])
         .output()
         .map_err(|e| {
             PicryptError::Encryption(format!(

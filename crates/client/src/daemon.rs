@@ -196,18 +196,23 @@ type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect_ws(ws_url: &str, auth_token: &str) -> anyhow::Result<WsStream> {
-    let request = tungstenite::http::Request::builder()
-        .uri(ws_url)
-        .header("Authorization", format!("Bearer {auth_token}"))
-        .header("Connection", "Upgrade")
-        .header("Upgrade", "websocket")
-        .header("Sec-WebSocket-Version", "13")
-        .header(
-            "Sec-WebSocket-Key",
-            tungstenite::handshake::client::generate_key(),
-        )
-        .body(())
-        .map_err(|e| anyhow::anyhow!("failed to build WS request: {e}"))?;
+    // Use tungstenite's IntoClientRequest to build the base request from the
+    // URL — this auto-populates Host, Sec-WebSocket-Version, Sec-WebSocket-Key,
+    // Connection, and Upgrade. We only need to add the Authorization header
+    // on top. Building the request manually via Request::builder() is what
+    // caused the "Missing, duplicated or incorrect header host" error prior
+    // to v0.1.5 — a custom builder replaces ALL headers and tungstenite does
+    // not re-populate Host.
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut request = ws_url
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("failed to build WS request from URL: {e}"))?;
+
+    let auth_value = format!("Bearer {auth_token}")
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid Authorization header value: {e}"))?;
+    request.headers_mut().insert("Authorization", auth_value);
 
     let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
         .await
