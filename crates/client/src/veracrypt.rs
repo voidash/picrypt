@@ -287,7 +287,7 @@ pub fn dismount(mount_point: &str) -> anyhow::Result<()> {
                      but existing file descriptors in held processes remain valid \
                      until those processes exit"
                 );
-                return Ok(());
+                Ok(())
             }
             Err(e) => {
                 anyhow::bail!(
@@ -362,7 +362,7 @@ fn lazy_umount(mount_point: &str) -> anyhow::Result<()> {
 ///   * `fd/*` — open files and open directories
 ///   * `cwd`  — the process's working directory
 ///   * `maps` — mmap'd files (sqlite with MMAP_SIZE, dynamically-loaded
-///              libs, etc.)
+///     libs, etc.)
 ///
 /// Self is excluded. Processes owned by other users are silently skipped
 /// unless picrypt-client is running as root — the installer's sudoers
