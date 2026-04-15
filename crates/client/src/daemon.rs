@@ -111,6 +111,11 @@ async fn try_mount_all(
             Ok(()) => {
                 println!("Mounted: {} -> {}", vol.container, vol.mount_point);
                 mounted_count += 1;
+                // Fire the post_mount hook AFTER the vault is actually
+                // mounted. Hook failures are logged but do not undo
+                // the mount — the vault is already up and the daemon
+                // will continue managing it.
+                volume::run_post_mount_hook(vol);
             }
             Err(e) => {
                 eprintln!(
@@ -136,6 +141,13 @@ async fn try_mount_all(
 
 fn force_dismount_all(config: &ClientConfig) {
     for vol in &config.volumes {
+        // Run the pre_dismount hook first so dependent services (e.g.
+        // pan-scraper on cdjk-linux) can cleanly save state before the
+        // filesystem goes away. The hook is bounded by a short timeout
+        // so a hung hook doesn't delay the panic dismount; after timeout
+        // it's SIGKILL'd and we proceed with the force dismount anyway.
+        volume::run_pre_dismount_hook(vol);
+
         if let Err(e) = volume::dismount(vol) {
             tracing::error!("failed to dismount {}: {e}", vol.mount_point);
         }

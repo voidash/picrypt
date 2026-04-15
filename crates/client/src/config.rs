@@ -82,6 +82,35 @@ pub struct VolumeConfig {
     /// heartbeat-timeout, once on final shutdown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismount_command: Option<String>,
+
+    /// Optional shell command to run AFTER a successful mount. Typically
+    /// used to start services that live inside the vault, e.g.
+    /// `sudo systemctl start pan-scraper`. Runs via `sh -c`. Runs on the
+    /// initial mount AND on every v0.1.9+ auto-remount. Failures are
+    /// logged but do not fail the mount itself — the vault is already
+    /// up by the time the hook runs.
+    ///
+    /// Timeout: 30 seconds. If the hook doesn't return, it's SIGKILL'd
+    /// and the daemon moves on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_mount_command: Option<String>,
+
+    /// Optional shell command to run BEFORE dismounting the volume.
+    /// Used to cleanly stop services that hold the vault busy, e.g.
+    /// `sudo systemctl stop pan-scraper`. Runs via `sh -c`.
+    ///
+    /// Runs on every dismount path: panic LOCK broadcast, heartbeat
+    /// dead-man, sleep detection, Ctrl+C. Failures are logged but do
+    /// NOT prevent the dismount — under panic semantics the vault
+    /// MUST come down even if cleanup fails.
+    ///
+    /// Timeout: 5 seconds. Shorter than post-mount because panic is
+    /// time-critical — an adversary at the door should not wait 30
+    /// seconds for a graceful shutdown. After the timeout, the hook
+    /// is SIGKILL'd and picrypt proceeds with the force-dismount path,
+    /// which in turn SIGKILL's any process still holding the vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_dismount_command: Option<String>,
 }
 
 impl ClientConfig {
@@ -214,6 +243,8 @@ mod tests {
                 mount_point: "/mnt/secure".to_string(),
                 mount_command: None,
                 dismount_command: None,
+                post_mount_command: None,
+                pre_dismount_command: None,
             }],
         };
 

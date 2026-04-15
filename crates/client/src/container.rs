@@ -63,6 +63,8 @@ pub async fn create(
             mount_point: mp.to_string(),
             mount_command: None,
             dismount_command: None,
+            post_mount_command: None,
+            pre_dismount_command: None,
         });
         config.save()?;
         println!("Added to config: {path} -> {mp}");
