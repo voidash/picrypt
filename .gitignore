@@ -46,6 +46,18 @@ secrets/
 .env.*
 !.env.example
 
+# Project-specific user-managed secret files. Staged at these exact
+# paths by the user as one-off "you can read this" signals for picrypt
+# CLI operations. They must never end up in a commit.
+rass.txt
+pass.txt
+.fmw
+panic.toml
+panic-tokens.toml
+
+# Claude Code session state (memory, plans, file history, etc.)
+.claude/
+
 # OS
 .Trashes
 .Spotlight-V100
