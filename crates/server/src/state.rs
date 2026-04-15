@@ -851,6 +851,22 @@ impl AppState {
             "server unsealed — {} device keyfiles decrypted",
             device_count
         );
+
+        // Broadcast an Unsealed message to any clients still holding a WS
+        // connection. After a panic lock, v0.1.9+ clients stay subscribed
+        // (dismounted but connected) specifically to catch this signal and
+        // auto-remount. Clients not currently connected will fall back to
+        // their periodic HTTP heartbeat probe and re-mount on the next tick.
+        //
+        // Failure to send is non-fatal — `unwrap_or(0)` returns 0 when there
+        // are no active subscribers, which is the expected cold-start case.
+        let notified = self.lock_tx.send(WsServerMessage::Unsealed).unwrap_or(0);
+        if notified > 0 {
+            tracing::info!(
+                "broadcast UNSEALED to {notified} connected client(s) — they will auto-remount"
+            );
+        }
+
         Ok(device_count)
     }
 

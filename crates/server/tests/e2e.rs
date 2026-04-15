@@ -442,25 +442,32 @@ async fn websocket_receives_lock_signal() {
         other => panic!("expected Text message with lock signal, got: {other:?}"),
     }
 
-    // The server should close the WebSocket after sending lock.
-    // Read next message — should be Close or stream end.
-    let close_result =
-        tokio::time::timeout(std::time::Duration::from_secs(5), ws_stream.next()).await;
-    match close_result {
-        Ok(Some(Ok(tungstenite::Message::Close(_)))) => {
-            // Expected: server sent a close frame.
+    // v0.1.9+ behavior: after sending Lock, the server KEEPS the WS open so
+    // that the client can receive a subsequent Unsealed broadcast without
+    // reconnecting. Verify the connection is still alive by unsealing the
+    // server again and expecting an Unsealed frame on the same socket.
+    let resp = server.unseal(TEST_PASSWORD).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "second unseal after lock should succeed"
+    );
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws_stream.next())
+        .await
+        .expect("timed out waiting for WS Unsealed message after second unseal")
+        .expect("WS stream ended unexpectedly — v0.1.9 server should keep it open across lock/unseal")
+        .expect("WS read error");
+
+    match msg {
+        tungstenite::Message::Text(text) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&text).expect("unsealed message should be valid JSON");
+            assert_eq!(
+                parsed["type"], "unsealed",
+                "expected unsealed message after second unseal, got: {parsed}"
+            );
         }
-        Ok(None) => {
-            // Also acceptable: stream ended (server closed without close frame).
-        }
-        Ok(Some(Err(_))) => {
-            // Connection error after close — acceptable.
-        }
-        Err(_) => {
-            panic!("timed out waiting for WebSocket close after lock");
-        }
-        Ok(Some(Ok(other))) => {
-            panic!("expected Close or stream end after lock, got: {other:?}");
-        }
+        other => panic!("expected Text message with unsealed signal, got: {other:?}"),
     }
 }

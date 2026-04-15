@@ -31,7 +31,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, device_id: Uuid)
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut lock_rx = state.subscribe_lock();
 
-    // Spawn a task that forwards broadcast messages (lock/shutdown) to this client.
+    // Spawn a task that forwards broadcast messages (lock/unsealed/shutdown)
+    // to this client. The task used to close the socket after sending a
+    // `Lock` — in v0.1.9+ we keep the socket open so that a subsequent
+    // `Unsealed` broadcast can reach the same client, letting it auto-remount
+    // without a manual `picrypt unlock` re-run. `Shutdown` still terminates
+    // the forwarder because there will be no further messages.
     let tx_handle = tokio::spawn(async move {
         loop {
             match lock_rx.recv().await {
@@ -47,8 +52,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, device_id: Uuid)
                         // Client disconnected.
                         break;
                     }
-                    // If this was a lock signal, close the connection after sending.
-                    if matches!(msg, WsServerMessage::Lock) {
+                    if matches!(msg, WsServerMessage::Shutdown) {
                         let _ = ws_tx.close().await;
                         break;
                     }

@@ -346,7 +346,15 @@ pub struct ErrorResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WsServerMessage {
     /// Panic lock — client must immediately dismount all volumes and purge keys.
+    /// The client keeps the WS connection alive after dismounting so it can
+    /// receive a subsequent `Unsealed` message and re-mount without a manual
+    /// `picrypt unlock` re-run.
     Lock,
+    /// Server transitioned SEALED -> ACTIVE. Clients with dismounted volumes
+    /// should re-fetch their keyfile via `GET /key/{device_id}` and remount.
+    /// Added in v0.1.9. Pre-v0.1.9 clients ignore unknown variants and will
+    /// instead re-mount on the next HTTP heartbeat probe.
+    Unsealed,
     /// Acknowledgement of a client heartbeat.
     HeartbeatAck { timestamp: i64 },
     /// Server is shutting down gracefully — dismount.
