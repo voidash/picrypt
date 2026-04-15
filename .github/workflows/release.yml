@@ -86,13 +86,13 @@ jobs:
         if: matrix.cross
         run: cargo install cross --locked --version 0.2.5
 
-      - name: Build with cross (server + client)
+      - name: Build with cross (server + client + panic-listener)
         if: matrix.cross && matrix.bins == 'server+client'
-        run: cross build --release --locked --target ${{ matrix.target }} -p picrypt-server -p picrypt-client
+        run: cross build --release --locked --target ${{ matrix.target }} -p picrypt-server -p picrypt-client -p picrypt-panic-listener
 
-      - name: Build with cargo (server + client)
+      - name: Build with cargo (server + client + panic-listener)
         if: ${{ !matrix.cross && matrix.bins == 'server+client' }}
-        run: cargo build --release --locked --target ${{ matrix.target }} -p picrypt-server -p picrypt-client
+        run: cargo build --release --locked --target ${{ matrix.target }} -p picrypt-server -p picrypt-client -p picrypt-panic-listener
 
       - name: Build with cargo (client only)
         if: ${{ !matrix.cross && matrix.bins == 'client' }}
@@ -112,6 +112,9 @@ jobs:
           if [[ "${{ matrix.bins }}" == *"server"* ]]; then
             cp "target/${{ matrix.target }}/release/picrypt-server" "dist/$stage/"
             strip "dist/$stage/picrypt-server" 2>/dev/null || true
+            # panic-listener ships alongside server on Linux targets.
+            cp "target/${{ matrix.target }}/release/picrypt-panic-listener" "dist/$stage/"
+            strip "dist/$stage/picrypt-panic-listener" 2>/dev/null || true
           fi
           cp "target/${{ matrix.target }}/release/picrypt-client" "dist/$stage/"
           strip "dist/$stage/picrypt-client" 2>/dev/null || true
@@ -122,7 +125,7 @@ jobs:
           # Server-only payload (Linux): deploy + Linux hardening
           if [[ "${{ matrix.bins }}" == *"server"* ]]; then
             mkdir -p "dist/$stage/deploy" "dist/$stage/scripts"
-            cp deploy/install-server.sh deploy/install-client.sh deploy/picrypt-server.service "dist/$stage/deploy/"
+            cp deploy/install-server.sh deploy/install-client.sh deploy/picrypt-server.service deploy/picrypt-panic-listener.service "dist/$stage/deploy/"
             cp scripts/harden-linux.sh "dist/$stage/scripts/"
             chmod +x "dist/$stage/deploy/"*.sh "dist/$stage/scripts/"*.sh
           fi

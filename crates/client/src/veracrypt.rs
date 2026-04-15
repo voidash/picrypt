@@ -584,8 +584,24 @@ pub fn create_container(
         .output()
         .context("failed to run veracrypt --create")?;
 
-    if !output.status.success() {
-        // Unblock writer thread by opening the read end of the FIFO.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // VeraCrypt has a known quirk where filesystem-creation failures (mkfs.ext4
+    // missing, mkfs.ext4 returning non-zero, etc.) are written to stdout/stderr
+    // but veracrypt itself exits with status 0. The container file gets
+    // created with a valid VeraCrypt header but the inner filesystem is
+    // unformatted/garbage, so the next `picrypt unlock` fails to mount.
+    //
+    // Detect this by also requiring the explicit success marker in stdout.
+    // veracrypt prints "The VeraCrypt volume has been successfully created."
+    // ONLY when the entire pipeline (header + format) succeeded.
+    let has_success_marker = stdout.contains("successfully created");
+    let exit_ok = output.status.success();
+
+    if !exit_ok || !has_success_marker {
+        // Unblock writer thread by opening the read end of the FIFO so the
+        // pipe write doesn't deadlock the join below.
         {
             use std::os::unix::fs::OpenOptionsExt;
             let _ = std::fs::OpenOptions::new()
@@ -595,8 +611,30 @@ pub fn create_container(
         }
         let _ = writer.join();
         let _ = std::fs::remove_dir_all(&tmp_dir);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("veracrypt --create failed: {}", stderr.trim());
+
+        // If the container file was partially created, remove it so the user
+        // doesn't see "looks fine on disk" and assume it's mountable.
+        let _ = std::fs::remove_file(path);
+
+        // Compose a useful error message. If exit was OK but the marker was
+        // missing, surface stdout (which contains the mkfs error) instead of
+        // just stderr (which is usually empty in that case).
+        let detail = if !exit_ok {
+            stderr.trim().to_string()
+        } else {
+            // Find the line that probably explains the failure.
+            stdout
+                .lines()
+                .filter(|l| {
+                    let l = l.trim();
+                    !l.is_empty() && !l.starts_with("Done:") && !l.contains("Speed:")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        anyhow::bail!(
+            "veracrypt --create failed (exit_ok={exit_ok}, success_marker={has_success_marker}): {detail}"
+        );
     }
 
     let _ = writer.join();

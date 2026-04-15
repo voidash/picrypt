@@ -1,0 +1,65 @@
+[Unit]
+Description=picrypt panic listener (Tailscale Funnel HTTP endpoint)
+Documentation=https://github.com/cdjk/picrypt
+After=network-online.target tailscaled.service picrypt-server.service
+Wants=network-online.target
+# Soft dependency on picrypt-server — we forward to its /lock endpoint,
+# but panic-listener itself can start before the server. It'll just fail
+# individual /panic requests until the server comes up.
+After=picrypt-server.service
+
+[Service]
+Type=simple
+# Runs as its own unprivileged user. See install-server.sh for user
+# creation. Falls back to `nobody` if the picrypt-panic user is missing,
+# so a fresh install still boots.
+User=picrypt-panic
+Group=picrypt-panic
+DynamicUser=no
+ExecStart=/usr/local/bin/picrypt-panic-listener --config /etc/picrypt/panic.toml http --bind 127.0.0.1:7124
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=10
+
+Environment=RUST_LOG=info
+
+# Read-only access to the config file (not the whole /etc/picrypt tree).
+# Config file must be readable by group picrypt-panic (mode 0640).
+# The binary itself needs no writable directories.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# Privilege hardening
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+PrivateDevices=yes
+
+# Network hardening — binds localhost 7124 (inbound) and makes an
+# outbound call to 127.0.0.1:7123 (main server). AF_INET is enough.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SocketBindDeny=*
+SocketBindAllow=tcp:7124
+
+# Namespaces / syscalls
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+KillMode=mixed
+KillSignal=SIGTERM
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=picrypt-panic-listener
+
+[Install]
+WantedBy=multi-user.target

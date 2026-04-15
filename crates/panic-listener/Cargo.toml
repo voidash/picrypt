@@ -1,0 +1,29 @@
+[package]
+name = "picrypt-panic-listener"
+description = "Small bridge that accepts an authenticated panic signal (via HTTP from Tailscale Funnel, or ntfy SSE) and forwards it to the local picrypt-server /lock endpoint. Runs as a separate process so its security surface is independent from the main server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = "0.8"
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }

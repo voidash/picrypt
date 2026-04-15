@@ -439,7 +439,7 @@ async fn cmd_unseal(
                     std::io::stderr().flush()?;
                     let mut pw = String::new();
                     std::io::stdin().read_line(&mut pw)?;
-                    let pw = pw.trim_end().to_string();
+                    let pw = clean_password(&pw);
                     if pw.is_empty() {
                         anyhow::bail!("password cannot be empty");
                     }
@@ -484,11 +484,11 @@ async fn cmd_unseal(
             std::io::stderr().flush()?;
             let mut pw = String::new();
             std::io::stdin().read_line(&mut pw)?;
-            let pw = pw.trim_end();
+            let pw = clean_password(&pw);
             if pw.is_empty() {
                 anyhow::bail!("password cannot be empty");
             }
-            client.unseal(pw).await?
+            client.unseal(&pw).await?
         }
     };
 
@@ -569,6 +569,23 @@ async fn cmd_status(config: &ClientConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Aggressively normalize a password string read from a file or stdin.
+///
+/// Strips a leading UTF-8 BOM (some text editors prepend one) and then
+/// `.trim()` removes ALL leading and trailing whitespace — spaces, tabs,
+/// `\n`, `\r`, vertical tab, form feed, etc. This is the right behavior
+/// for password files because:
+///   - `echo > file` adds `\n`
+///   - Windows editors add `\r\n`
+///   - Some editors silently add a UTF-8 BOM
+///   - Copy/paste sometimes adds trailing spaces
+///
+/// A password that genuinely starts or ends with whitespace would be
+/// indistinguishable from these accidents and is bad practice anyway.
+fn clean_password(raw: &str) -> String {
+    raw.strip_prefix('\u{feff}').unwrap_or(raw).trim().to_string()
+}
+
 /// Read the master password from (in order): explicit --password,
 /// --password-file, piped stdin (only if stdin is NOT a TTY). Mirrors
 /// the logic in cmd_admin_token but factored out so the dual-factor
@@ -581,7 +598,7 @@ fn resolve_master_password(
     let password = if let Some(path) = password_file {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read password file {path}"))?;
-        raw.trim_end_matches(['\n', '\r']).to_string()
+        clean_password(&raw)
     } else if let Some(pw) = password_arg {
         pw
     } else if !std::io::stdin().is_terminal() {
@@ -589,7 +606,7 @@ fn resolve_master_password(
         std::io::stdin()
             .read_line(&mut buf)
             .context("failed to read password from stdin")?;
-        buf.trim_end_matches(['\n', '\r']).to_string()
+        clean_password(&buf)
     } else {
         anyhow::bail!("no password provided. Use --password-file, --password, or pipe via stdin");
     };
@@ -776,7 +793,7 @@ async fn cmd_admin_token(
     let password = if let Some(path) = password_file {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read password file {path}"))?;
-        raw.trim_end_matches(['\n', '\r']).to_string()
+        clean_password(&raw)
     } else if let Some(pw) = password_arg {
         pw
     } else if !std::io::stdin().is_terminal() {
@@ -784,7 +801,7 @@ async fn cmd_admin_token(
         std::io::stdin()
             .read_line(&mut buf)
             .context("failed to read password from stdin")?;
-        buf.trim_end_matches(['\n', '\r']).to_string()
+        clean_password(&buf)
     } else {
         anyhow::bail!("no password provided. Use --password-file, --password, or pipe via stdin");
     };
@@ -847,5 +864,61 @@ fn detect_platform() -> picrypt_common::protocol::Platform {
         picrypt_common::protocol::Platform::Windows
     } else {
         picrypt_common::protocol::Platform::Linux
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_password_strips_trailing_lf() {
+        assert_eq!(clean_password("hunter2\n"), "hunter2");
+    }
+
+    #[test]
+    fn clean_password_strips_trailing_crlf() {
+        assert_eq!(clean_password("hunter2\r\n"), "hunter2");
+    }
+
+    #[test]
+    fn clean_password_strips_multiple_trailing_newlines() {
+        assert_eq!(clean_password("hunter2\n\n\n"), "hunter2");
+    }
+
+    #[test]
+    fn clean_password_strips_leading_and_trailing_whitespace() {
+        assert_eq!(clean_password("  hunter2  "), "hunter2");
+        assert_eq!(clean_password("\thunter2\t"), "hunter2");
+    }
+
+    #[test]
+    fn clean_password_strips_utf8_bom() {
+        // \u{FEFF} = UTF-8 BOM; some editors prepend it silently.
+        assert_eq!(clean_password("\u{feff}hunter2\n"), "hunter2");
+    }
+
+    #[test]
+    fn clean_password_strips_utf8_bom_with_only_whitespace_after() {
+        // BOM + trailing newline + nothing else = empty (caller bails out).
+        assert_eq!(clean_password("\u{feff}\n"), "");
+    }
+
+    #[test]
+    fn clean_password_preserves_internal_whitespace() {
+        // Spaces inside the password must NOT be touched — they're part of
+        // the secret, not formatting.
+        assert_eq!(clean_password("  multi word pass  \n"), "multi word pass");
+    }
+
+    #[test]
+    fn clean_password_no_change_for_already_clean() {
+        assert_eq!(clean_password("hunter2"), "hunter2");
+    }
+
+    #[test]
+    fn clean_password_empty_input() {
+        assert_eq!(clean_password(""), "");
+        assert_eq!(clean_password("   \n\r\t"), "");
     }
 }
