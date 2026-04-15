@@ -39,6 +39,7 @@ use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
@@ -93,6 +94,15 @@ struct PanicConfig {
     /// `http://127.0.0.1:7123`.
     #[serde(default = "default_picrypt_url")]
     picrypt_server_url: String,
+
+    /// Origins allowed to POST /panic via CORS (i.e. browser-based
+    /// clients like a paste-token PWA). The panic-listener answers
+    /// the preflight OPTIONS with Access-Control-Allow-Origin set to
+    /// these values. Non-browser clients (curl, native apps, HTTP
+    /// Shortcuts on Android) don't do preflight and are unaffected.
+    /// Empty list = no browser origins allowed; curl/native still work.
+    #[serde(default)]
+    allowed_origins: Vec<String>,
 
     /// One or more trusted contacts, each with their own token. Tokens
     /// are compared constant-time. Labels are logged on every event.
@@ -316,9 +326,44 @@ async fn panic_handler(
 }
 
 fn build_router(state: AppState) -> Router {
+    // Build the CORS layer. Only the origins listed in `allowed_origins`
+    // get CORS headers; everyone else (curl, native HTTP Shortcuts,
+    // etc.) doesn't care about CORS and works unchanged. An empty list
+    // means no browser origins allowed, which is the secure default.
+    let cors = if state.config.allowed_origins.is_empty() {
+        // Browser-less mode. CorsLayer::new() with no allow-origin is
+        // effectively a no-op for fetch(credentials: 'omit') — the
+        // server still responds, but browsers will see the missing
+        // Access-Control-Allow-Origin header and block the response.
+        CorsLayer::new()
+    } else {
+        // Parse the allowed origins into HeaderValue once at startup.
+        // Malformed entries are logged and skipped rather than fatally
+        // erroring — the listener should still come up even if one
+        // config line is typo'd.
+        let origins: Vec<axum::http::HeaderValue> = state
+            .config
+            .allowed_origins
+            .iter()
+            .filter_map(|o| match o.parse::<axum::http::HeaderValue>() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn!("ignoring invalid allowed_origin {o:?}: {e}");
+                    None
+                }
+            })
+            .collect();
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods([axum::http::Method::POST, axum::http::Method::OPTIONS])
+            .allow_headers([axum::http::header::CONTENT_TYPE])
+            .max_age(std::time::Duration::from_secs(600))
+    };
+
     Router::new()
         .route("/health", get(health))
         .route("/panic", post(panic_handler))
+        .layer(cors)
         .layer(RequestBodyLimitLayer::new(1024)) // 1 KB is plenty for a token + label
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -378,6 +423,7 @@ mod tests {
         PanicConfig {
             lock_pin: "34026".to_string(),
             picrypt_server_url: "http://127.0.0.1:7123".to_string(),
+            allowed_origins: vec![],
             contact: vec![
                 ContactConfig {
                     label: "alice".to_string(),
