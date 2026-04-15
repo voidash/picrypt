@@ -503,12 +503,38 @@ async fn cmd_unlock(config: &ClientConfig) -> anyhow::Result<()> {
 
     let client = connection::ServerClient::new(config)?;
 
-    let heartbeat = client.heartbeat().await?;
-    if heartbeat.state != picrypt_common::protocol::ServerState::Active {
-        anyhow::bail!(
-            "server is {} — cannot unlock. Unseal the Pi first.",
-            heartbeat.state
-        );
+    // v0.1.9+: don't hard-fail when the server is sealed at startup. The
+    // daemon handles sealed-at-boot by entering standby and auto-mounting
+    // when the server transitions to Active (via the Unsealed WS broadcast
+    // or the HTTP probe backstop). This lets systemd-managed clients like
+    // omv's picrypt-unlock.service start before the daily unseal and wait
+    // politely rather than exiting and triggering a restart loop.
+    //
+    // A warning is still logged so an interactive user running `picrypt
+    // unlock` sees why their vault isn't mounting yet.
+    match client.heartbeat().await {
+        Ok(hb) if hb.state == picrypt_common::protocol::ServerState::Active => {
+            tracing::info!("server is Active — mounting immediately");
+        }
+        Ok(hb) => {
+            tracing::warn!(
+                "server is {} — daemon will start in standby and auto-mount on unseal",
+                hb.state
+            );
+            eprintln!(
+                "Note: server is {}. Daemon will wait and auto-mount when you \
+                 unseal the Pi.",
+                hb.state
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "initial heartbeat failed ({e}) — daemon will keep retrying"
+            );
+            eprintln!(
+                "Note: server unreachable ({e}). Daemon will keep trying."
+            );
+        }
     }
 
     daemon::run(config, client).await
