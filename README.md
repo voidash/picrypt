@@ -12,9 +12,19 @@ This is not a general-purpose secrets manager. It exists for one threat model:
 **physical seizure or coercion**, where the attacker has your laptop and is
 pointing a wrench at you.
 
-> ⚠️ **Status:** v0.1.0. Real cryptography, real VeraCrypt integration, real
-> tests, but no third-party security audit. Read the
-> [Security model](#security-model) before relying on it.
+> ⚠️ **Status:** v0.1.12. Real cryptography, real VeraCrypt integration, real
+> tests, persistent client daemon with auto-remount across lock/unseal cycles,
+> Tailscale Funnel panic path with a browser PWA, vault-bound service hooks.
+> No third-party security audit. Read the [Security model](#security-model)
+> before relying on it.
+>
+> **Recent versions** — see commit history for details:
+> - **0.1.12** — post-mount / pre-dismount service hooks per volume
+> - **0.1.11** — panic-listener CORS for browser-originated panic
+> - **0.1.10** — client daemon starts in standby if server is sealed at boot
+> - **0.1.9**  — persistent client daemon survives lock/unseal cycles
+> - **0.1.8**  — standalone panic-listener bridge (Tailscale Funnel)
+> - **0.1.7**  — mandatory dual-factor unseal (master password + YubiKey)
 
 ---
 
@@ -24,9 +34,13 @@ pointing a wrench at you.
 
 - **Cold seizure.** Your laptop gets taken while you are away from it. Without
   a live network path to the key server, the volumes cannot be re-mounted.
-- **Coerced unlock.** Anyone with the lock PIN can hit one HTTP endpoint and
-  re-seal the server. Within `heartbeat_timeout_secs` (default: 120s), every
-  connected client auto-dismounts. The Android widget makes this a single tap.
+- **Coerced unlock.** Anyone with a valid panic token can hit one HTTP endpoint
+  and re-seal the server. Every connected client dismounts within a second
+  via WebSocket LOCK broadcast (fallback: `heartbeat_timeout_secs`, default
+  300s). From v0.1.9 onwards clients also auto-remount when you re-unseal,
+  so there's no manual re-run per device. Panic sources: curl against the
+  Tailnet endpoint, Android HTTP Shortcuts, or a browser PWA hosted at a
+  public URL behind Tailscale Funnel.
 - **Server compromise → key exfiltration is bounded by being sealed.** The
   server stores the master key encrypted at rest (Argon2id + AES-256-GCM). It
   is only decrypted in RAM after the operator unseals it with the master
@@ -86,15 +100,24 @@ pointing a wrench at you.
 
 ```
 crates/
-  common/   shared types, crypto primitives (Argon2id, AES-256-GCM)
-  server/   axum HTTP + WebSocket server, sealed/active state machine
-  client/   CLI: init, register, unlock (mount + heartbeat loop), panic
-android/    panic-lock widget (Kotlin, AndroidX)
-deploy/     install scripts and systemd unit
-scripts/    OS hardening scripts (Linux, macOS, Windows)
-functional-tests/
-            Python integration tests using flexitest. Spawns a real server,
-            performs real VeraCrypt mount/dismount on Linux + macOS.
+  common/          shared types, crypto primitives (Argon2id, AES-256-GCM,
+                   dual-factor key derivation)
+  server/          axum HTTP + WebSocket server, sealed/active state machine,
+                   Lock + Unsealed broadcasts
+  client/          CLI + persistent daemon: init, register, unlock (mount +
+                   heartbeat loop that survives lock/unseal cycles), panic,
+                   create-container, dual-factor enroll/finalize
+  panic-listener/  tight bridge binary on the server host. Accepts
+                   authenticated POST /panic from the public internet
+                   (typically via Tailscale Funnel) and forwards to local
+                   /lock. Has per-contact token auth, configurable CORS, and
+                   runs as its own systemd unit with sandboxing.
+android/           panic-lock widget (Kotlin, AndroidX)
+deploy/            install scripts and systemd units
+scripts/           OS hardening scripts (Linux, macOS, Windows)
+functional-tests/  Python integration tests using flexitest. Spawns a real
+                   server, performs real VeraCrypt mount/dismount on
+                   Linux + macOS.
 ```
 
 ---
@@ -103,23 +126,42 @@ functional-tests/
 
 ### 1. Server (Raspberry Pi or any Linux box on your tailnet)
 
-Download the verified release binary (see [Verifying releases](#verifying-releases)
-below):
+**Option A: automated release download** (recommended). The install script
+downloads the tarball, verifies SHA256, verifies the cosign signature (if
+cosign is installed), extracts the binaries, and installs both `picrypt-server`
+and `picrypt-panic-listener`:
 
 ```bash
-# x86_64 Linux example — substitute your arch
-curl -LO https://github.com/voidash/picrypt/releases/download/v0.1.0/picrypt-server-x86_64-unknown-linux-musl.tar.gz
-curl -LO https://github.com/voidash/picrypt/releases/download/v0.1.0/picrypt-server-x86_64-unknown-linux-musl.tar.gz.sig
-curl -LO https://github.com/voidash/picrypt/releases/download/v0.1.0/picrypt-server-x86_64-unknown-linux-musl.tar.gz.crt
+# Get the install script (from a git clone or direct download)
+curl -fsSL -o install-server.sh \
+  https://raw.githubusercontent.com/voidash/picrypt/main/deploy/install-server.sh
+chmod +x install-server.sh
 
+sudo ./install-server.sh --release v0.1.12
+```
+
+**Option B: manual download + verify.** If you prefer to handle the download
+and verification yourself:
+
+```bash
+# aarch64 example for Raspberry Pi — substitute your arch
+TAG=v0.1.12
+ARCH=aarch64-unknown-linux-musl
+curl -LO "https://github.com/voidash/picrypt/releases/download/${TAG}/picrypt-${TAG}-${ARCH}.tar.gz"
+curl -LO "https://github.com/voidash/picrypt/releases/download/${TAG}/picrypt-${TAG}-${ARCH}.tar.gz.sha256"
+curl -LO "https://github.com/voidash/picrypt/releases/download/${TAG}/picrypt-${TAG}-${ARCH}.tar.gz.sig"
+curl -LO "https://github.com/voidash/picrypt/releases/download/${TAG}/picrypt-${TAG}-${ARCH}.tar.gz.crt"
+
+shasum -a 256 -c "picrypt-${TAG}-${ARCH}.tar.gz.sha256"
 cosign verify-blob \
-  --certificate picrypt-server-x86_64-unknown-linux-musl.tar.gz.crt \
-  --signature   picrypt-server-x86_64-unknown-linux-musl.tar.gz.sig \
-  --certificate-identity-regexp 'https://github.com/voidash/picrypt/.*' \
+  --certificate "picrypt-${TAG}-${ARCH}.tar.gz.crt" \
+  --signature   "picrypt-${TAG}-${ARCH}.tar.gz.sig" \
+  --certificate-identity-regexp '^https://github\.com/voidash/picrypt/\.github/workflows/release\.yml@refs/tags/v.*$' \
   --certificate-oidc-issuer     https://token.actions.githubusercontent.com \
-  picrypt-server-x86_64-unknown-linux-musl.tar.gz
+  "picrypt-${TAG}-${ARCH}.tar.gz"
 
-tar xzf picrypt-server-x86_64-unknown-linux-musl.tar.gz
+tar xzf "picrypt-${TAG}-${ARCH}.tar.gz"
+cd "picrypt-${TAG}-${ARCH}"
 sudo ./deploy/install-server.sh --binary ./picrypt-server
 ```
 
@@ -127,9 +169,12 @@ The installer will:
 
 - Create a `picrypt` system user
 - Install the binary to `/usr/local/bin/picrypt-server`
-- Generate `/home/picrypt/.picrypt/server.toml` with a fresh **admin token** and
+- Generate `/var/lib/picrypt/.picrypt/server.toml` with a fresh **admin token** and
   **lock PIN** (printed once — save them)
-- Install and start `picrypt-server.service` via systemd
+- Create `picrypt-panic` user, install the panic-listener binary and service,
+  generate `/etc/picrypt/panic.toml` with a fresh **contact token** (printed once)
+- Install and start both `picrypt-server.service` and
+  `picrypt-panic-listener.service` via systemd
 - Run the Linux hardening script (firewall, sysctls, kernel params)
 
 The server starts in the **sealed** state. To bring it up:
@@ -145,27 +190,43 @@ afterwards is what unseals subsequent times.
 
 ### 2. Client (your laptop)
 
-```bash
-curl -LO https://github.com/voidash/picrypt/releases/download/v0.1.0/picrypt-client-aarch64-apple-darwin.tar.gz
-# ... verify with cosign as above ...
-tar xzf picrypt-client-aarch64-apple-darwin.tar.gz
-sudo install -m 0755 picrypt-client /usr/local/bin/
+**Option A: automated release download:**
 
-picrypt-client init --server-url http://<tailscale-ip>:7123
-picrypt-client register --name "$(hostname)" --admin-token <admin-token>
-# This writes ~/.picrypt/client.toml with a per-device auth token.
+```bash
+curl -fsSL -o install-client.sh \
+  https://raw.githubusercontent.com/voidash/picrypt/main/deploy/install-client.sh
+chmod +x install-client.sh
+
+./install-client.sh --release v0.1.12
 ```
+
+**Option B: manual download + install:**
+
+```bash
+TAG=v0.1.12
+# macOS Apple Silicon example — substitute your target
+ARCH=aarch64-apple-darwin
+curl -LO "https://github.com/voidash/picrypt/releases/download/${TAG}/picrypt-${TAG}-${ARCH}.tar.gz"
+# ... verify SHA256 + cosign as shown above for the server ...
+tar xzf "picrypt-${TAG}-${ARCH}.tar.gz"
+cd "picrypt-${TAG}-${ARCH}"
+./deploy/install-client.sh --binary ./picrypt-client
+```
+
+The installer prompts for the server URL and admin token, then registers the
+device. It also offers to set up a persistent daemon that starts at login.
 
 To create a new VeraCrypt vault with the server-managed keyfile and start
 mounting it:
 
 ```bash
-picrypt-client create-vault --container ~/vault.hc --size 10G --mount-point ~/Vault
-picrypt-client unlock   # mounts everything in client.toml + runs heartbeat
+picrypt create-container --path ~/vault.hc --size 10G --mount-point ~/Vault
+picrypt unlock   # persistent daemon: mounts, heartbeats, auto-remounts on unseal
 ```
 
-`picrypt-client unlock` is the daemon. Leave it running. If the server
-disappears, it will auto-dismount within the heartbeat timeout.
+`picrypt unlock` is the persistent daemon (v0.1.9+). Leave it running. It
+survives server lock/unseal cycles and auto-remounts when the server comes
+back. If the server disappears, it auto-dismounts within the heartbeat timeout.
 
 ### 3. Android panic widget
 
@@ -273,6 +334,87 @@ secret, and the server's `data/` directory (or the backup of it).
   directory's dual-factor blob is unrecoverable. This is by design — it's what
   makes dual-factor meaningful — but it means you MUST have at least one
   working factor at all times.
+
+---
+
+## Vault-bound service hooks (v0.1.12+)
+
+Each volume in `client.toml` can declare shell commands that run automatically
+when the vault mounts or is about to dismount. This lets you tie services to
+the vault lifecycle — e.g. starting a database only while the encrypted volume
+is available, and stopping it before dismount so nothing writes to a vanishing
+mountpoint.
+
+```toml
+# ~/.picrypt/client.toml example
+[[volumes]]
+container_path = "~/vault.hc"
+mount_point = "~/Vault"
+post_mount_command = "sudo /bin/systemctl start my-service"
+pre_dismount_command = "sudo /bin/systemctl stop my-service"
+```
+
+- `post_mount_command` runs via `sh -c` after a successful mount (30s timeout).
+- `pre_dismount_command` runs before dismount (5s timeout; child gets SIGKILL
+  on timeout so the dismount isn't blocked indefinitely).
+
+**Sudoers pattern.** If the hook needs root (e.g. `systemctl start`), grant
+passwordless sudo for exactly the commands it runs. Create
+`/etc/sudoers.d/picrypt-hooks`:
+
+```
+youruser ALL=(root) NOPASSWD: /bin/systemctl start my-service, \
+                               /bin/systemctl stop my-service
+```
+
+Keep the allow-list tight — only the specific `systemctl start/stop` commands
+the hooks actually need. Validate with `sudo visudo -cf /etc/sudoers.d/picrypt-hooks`
+before relying on it.
+
+---
+
+## System-level daemon for headless clients
+
+The install script sets up a **user-level** systemd service (or macOS
+LaunchAgent) that starts `picrypt unlock` at login. This works for laptops
+where someone logs in interactively.
+
+For headless machines (e.g. an always-on NAS that should mount its vault at
+boot without anyone logging in), you need a **system-level** unit instead.
+The install script does not create this automatically because it requires
+root-level decisions about which user runs the daemon and how credentials
+are managed.
+
+Example `/etc/systemd/system/picrypt-unlock.service`:
+
+```ini
+[Unit]
+Description=picrypt persistent unlock daemon
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=simple
+User=youruser
+Group=youruser
+ExecStart=/usr/local/bin/picrypt unlock
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+Environment=HOME=/home/youruser
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable with `sudo systemctl enable --now picrypt-unlock.service`. The daemon
+will start at boot (before any user logs in) and will survive reboots. It
+enters standby if the server is sealed and auto-mounts when you unseal.
+
+If your vault has service hooks that need `sudo`, make sure the sudoers
+allow-list (see [Vault-bound service hooks](#vault-bound-service-hooks-v0112))
+covers the user running the daemon.
 
 ---
 

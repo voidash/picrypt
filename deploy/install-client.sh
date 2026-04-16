@@ -7,8 +7,9 @@
 #
 # Usage:
 #   ./install-client.sh [--binary /path/to/picrypt-client]
+#   ./install-client.sh [--release v0.1.12]
 #
-# If --binary is not provided, builds from source with cargo.
+# If neither --binary nor --release is provided, builds from source with cargo.
 
 set -euo pipefail
 
@@ -44,7 +45,7 @@ prompt_value() {
         die "${var_name} is required"
     fi
 
-    eval "${var_name}=\"${value}\""
+    printf -v "${var_name}" '%s' "${value}"
 }
 
 confirm() {
@@ -55,10 +56,108 @@ confirm() {
 }
 
 # --------------------------------------------------------------------------- #
+# Release download helpers
+# --------------------------------------------------------------------------- #
+
+GITHUB_REPO="voidash/picrypt"
+
+detect_target() {
+    local os arch
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    case "${os}" in
+        Linux)
+            case "${arch}" in
+                x86_64)  echo "x86_64-unknown-linux-musl" ;;
+                aarch64) echo "aarch64-unknown-linux-musl" ;;
+                *)       die "Unsupported architecture: ${arch}" ;;
+            esac
+            ;;
+        Darwin)
+            case "${arch}" in
+                x86_64)  echo "x86_64-apple-darwin" ;;
+                arm64)   echo "aarch64-apple-darwin" ;;
+                *)       die "Unsupported architecture: ${arch}" ;;
+            esac
+            ;;
+        *)
+            die "Unsupported OS: ${os}"
+            ;;
+    esac
+}
+
+# download_release TAG TARGET
+# Downloads, verifies, and extracts a release tarball.
+# Sets RELEASE_DIR to the extracted directory path.
+download_release() {
+    local tag="$1"
+    local target="$2"
+    local base="picrypt-${tag}-${target}"
+    local archive="${base}.tar.gz"
+    local url_base="https://github.com/${GITHUB_REPO}/releases/download/${tag}"
+
+    RELEASE_TMPDIR="$(mktemp -d)"
+
+    log_info "Downloading ${archive}..."
+    curl -fSL -o "${RELEASE_TMPDIR}/${archive}" "${url_base}/${archive}" \
+        || die "Failed to download ${archive}. Check that tag '${tag}' exists and has a build for '${target}'."
+
+    log_info "Downloading verification files..."
+    curl -fSL -o "${RELEASE_TMPDIR}/${archive}.sha256" "${url_base}/${archive}.sha256" \
+        || die "Failed to download SHA256 checksum"
+    curl -fSL -o "${RELEASE_TMPDIR}/${archive}.sig" "${url_base}/${archive}.sig" \
+        || die "Failed to download cosign signature"
+    curl -fSL -o "${RELEASE_TMPDIR}/${archive}.crt" "${url_base}/${archive}.crt" \
+        || die "Failed to download cosign certificate"
+
+    log_info "Verifying SHA256 checksum..."
+    (cd "${RELEASE_TMPDIR}" && shasum -a 256 -c "${archive}.sha256") \
+        || die "SHA256 verification FAILED — do not use this binary"
+    log_ok "SHA256 checksum verified"
+
+    if command -v cosign &>/dev/null; then
+        log_info "Verifying cosign signature..."
+        cosign verify-blob \
+            --certificate "${RELEASE_TMPDIR}/${archive}.crt" \
+            --signature "${RELEASE_TMPDIR}/${archive}.sig" \
+            --certificate-identity-regexp "^https://github\\.com/${GITHUB_REPO}/\\.github/workflows/release\\.yml@refs/tags/v.*\$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${RELEASE_TMPDIR}/${archive}" \
+            || die "Cosign signature verification FAILED — do not use this binary"
+        log_ok "Cosign signature verified"
+    else
+        log_warn "================================================================"
+        log_warn "cosign is not installed — skipping signature verification."
+        log_warn "The SHA256 checksum passed, but without cosign you cannot verify"
+        log_warn "that the binary was built by the official CI pipeline."
+        log_warn "Install cosign: https://docs.sigstore.dev/cosign/installation/"
+        log_warn "================================================================"
+    fi
+
+    log_info "Extracting ${archive}..."
+    tar -xzf "${RELEASE_TMPDIR}/${archive}" -C "${RELEASE_TMPDIR}"
+
+    RELEASE_DIR="${RELEASE_TMPDIR}/${base}"
+    if [[ ! -d "${RELEASE_DIR}" ]]; then
+        die "Expected directory ${base} not found after extraction"
+    fi
+    log_ok "Release ${tag} extracted"
+}
+
+cleanup_release_tmpdir() {
+    if [[ -n "${RELEASE_TMPDIR:-}" && -d "${RELEASE_TMPDIR}" ]]; then
+        rm -rf "${RELEASE_TMPDIR}"
+    fi
+}
+
+# --------------------------------------------------------------------------- #
 # Parse arguments
 # --------------------------------------------------------------------------- #
 
 BINARY_PATH=""
+RELEASE_TAG=""
+RELEASE_TMPDIR=""
+RELEASE_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -69,11 +168,21 @@ while [[ $# -gt 0 ]]; do
             BINARY_PATH="$2"
             shift 2
             ;;
+        --release)
+            if [[ -z "${2:-}" ]]; then
+                die "--release requires a tag argument (e.g. v0.1.12)"
+            fi
+            RELEASE_TAG="$2"
+            shift 2
+            ;;
         -h|--help)
-            echo "Usage: $0 [--binary /path/to/picrypt-client]"
+            echo "Usage: $0 [--binary /path/to/picrypt-client] [--release vX.Y.Z]"
             echo ""
             echo "Options:"
-            echo "  --binary PATH   Use a pre-built binary instead of building from source"
+            echo "  --binary PATH    Use a pre-built binary instead of building from source"
+            echo "  --release TAG    Download a verified release from GitHub (e.g. --release v0.1.12)"
+            echo ""
+            echo "If neither is provided, builds from source with cargo."
             exit 0
             ;;
         *)
@@ -81,6 +190,10 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "${BINARY_PATH}" && -n "${RELEASE_TAG}" ]]; then
+    die "--binary and --release are mutually exclusive"
+fi
 
 # --------------------------------------------------------------------------- #
 # Detect OS
@@ -100,6 +213,20 @@ case "${OS}" in
 esac
 
 log_info "Detected OS: ${OS_TYPE}"
+
+# --------------------------------------------------------------------------- #
+# Handle --release: download and verify
+# --------------------------------------------------------------------------- #
+
+if [[ -n "${RELEASE_TAG}" ]]; then
+    TARGET="$(detect_target)"
+    download_release "${RELEASE_TAG}" "${TARGET}"
+    trap cleanup_release_tmpdir EXIT
+    BINARY_PATH="${RELEASE_DIR}/picrypt-client"
+    if [[ ! -f "${BINARY_PATH}" ]]; then
+        die "picrypt-client binary not found in release archive at ${BINARY_PATH}"
+    fi
+fi
 
 # --------------------------------------------------------------------------- #
 # Determine install directory
@@ -138,10 +265,10 @@ if [[ -n "${BINARY_PATH}" ]]; then
     install -m 0755 "${BINARY_PATH}" "${INSTALL_DIR}/picrypt"
     log_ok "Binary installed to ${INSTALL_DIR}/picrypt"
 else
-    log_info "No --binary provided, building from source with cargo..."
+    log_info "No --binary or --release provided, building from source with cargo..."
 
     if ! command -v cargo &>/dev/null; then
-        die "cargo not found. Either provide --binary or install Rust: https://rustup.rs"
+        die "cargo not found. Provide --binary, use --release, or install Rust: https://rustup.rs"
     fi
 
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -149,7 +276,7 @@ else
     if [[ -f "${SCRIPT_DIR}/../Cargo.toml" ]]; then
         REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
     else
-        die "Cannot find project source. Provide --binary or run from the repo's deploy/ directory."
+        die "Cannot find project source. Provide --binary, use --release, or run from the repo's deploy/ directory."
     fi
 
     log_info "Building from ${REPO_DIR}..."
@@ -199,11 +326,11 @@ else
 fi
 
 # --------------------------------------------------------------------------- #
-# Optional: auto-unlock service
+# Optional: auto-unlock daemon
 # --------------------------------------------------------------------------- #
 
 echo ""
-if confirm "Set up auto-unlock at login?"; then
+if confirm "Set up persistent unlock daemon at login?"; then
 
     if [[ "${OS_TYPE}" == "macos" ]]; then
         # macOS: LaunchAgent
@@ -231,7 +358,7 @@ if confirm "Set up auto-unlock at login?"; then
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <true/>
     <key>StandardOutPath</key>
     <string>${HOME}/.picrypt/unlock.log</string>
     <key>StandardErrorPath</key>
@@ -247,11 +374,11 @@ PLIST
             log_ok "Created LaunchAgent at ${AGENT_PLIST}"
             log_info "Loading agent..."
             launchctl load "${AGENT_PLIST}" 2>/dev/null || true
-            log_info "picrypt unlock will run automatically at next login"
+            log_info "picrypt unlock daemon will run at login and restart on crash"
         fi
 
     elif [[ "${OS_TYPE}" == "linux" ]]; then
-        # Linux: user systemd service
+        # Linux: user systemd service (persistent daemon, not oneshot)
         SERVICE_DIR="${HOME}/.config/systemd/user"
         SERVICE_FILE="${SERVICE_DIR}/picrypt-unlock.service"
 
@@ -262,12 +389,15 @@ PLIST
         else
             cat > "${SERVICE_FILE}" <<UNIT
 [Unit]
-Description=picrypt auto-unlock
+Description=picrypt persistent unlock daemon
 After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 ExecStart=${PICRYPT} unlock
+Restart=on-failure
+RestartSec=5
 Environment=RUST_LOG=info
 
 [Install]
@@ -276,12 +406,12 @@ UNIT
             systemctl --user daemon-reload
             systemctl --user enable picrypt-unlock.service
             log_ok "Created and enabled user service at ${SERVICE_FILE}"
-            log_info "picrypt unlock will run automatically at next login"
-            log_info "To run now: systemctl --user start picrypt-unlock"
+            log_info "picrypt unlock daemon will run at login and restart on crash"
+            log_info "To start now: systemctl --user start picrypt-unlock"
         fi
     fi
 else
-    log_info "Skipping auto-unlock setup. You can run 'picrypt unlock' manually."
+    log_info "Skipping daemon setup. You can run 'picrypt unlock' manually."
 fi
 
 # --------------------------------------------------------------------------- #
@@ -298,7 +428,7 @@ echo "  Config:   ${CONFIG_FILE}"
 echo ""
 echo "  Useful commands:"
 echo "    picrypt status            — check server and volume status"
-echo "    picrypt unlock            — mount encrypted volumes"
+echo "    picrypt unlock            — start persistent daemon (mount + heartbeat)"
 echo "    picrypt lock              — dismount all volumes"
 echo "    picrypt panic             — emergency lock all devices"
 echo "    picrypt create-container  — create a new VeraCrypt container"
@@ -306,6 +436,6 @@ echo ""
 echo "  To create your first encrypted container:"
 echo "    picrypt create-container --path ~/vault.hc --size 10G --mount-point ~/Vault"
 echo ""
-echo "  Then unlock:"
+echo "  Then start the daemon:"
 echo "    picrypt unlock"
 echo ""
